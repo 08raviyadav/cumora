@@ -7,16 +7,14 @@ import assert from 'node:assert/strict'
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
-import { afterEach, test } from 'node:test'
+import { afterEach, beforeEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
 import { type ProviderProfile, providerProfileEnv } from '../agents/computer/provider-profiles.js'
 import { CLAUDE_CORE_ENV_KEYS, CLAUDE_TURN_ENV_KEYS } from '../agents/computer/claude-user-settings.js'
 
 const IS_WIN = process.platform === 'win32'
-const ORIGINAL_PATH = process.env.PATH
-const ORIGINAL_PATHEXT = process.env.PATHEXT
-const ORIGINAL_UNSANDBOXED = process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+const original = { ...process.env }
 const tempDirs: string[] = []
 // Sessions spawn a child process. Track them so a FAILING assertion still tears
 // the child down — otherwise it outlives the test and the runner never exits.
@@ -67,14 +65,18 @@ test('engine subprocesses always suppress Windows console windows', () => {
   })
 })
 
+beforeEach(async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cumora-engine-test-home-'))
+  tempDirs.push(home)
+  process.env.HOME = home
+  process.env.USERPROFILE = home
+  process.env.CODEX_HOME = join(home, 'personal-codex')
+})
+
 afterEach(async () => {
   for (const s of liveSessions.splice(0)) { try { await s.stop() } catch { /* already gone */ } }
-  if (ORIGINAL_PATH === undefined) delete process.env.PATH
-  else process.env.PATH = ORIGINAL_PATH
-  if (ORIGINAL_PATHEXT === undefined) delete process.env.PATHEXT
-  else process.env.PATHEXT = ORIGINAL_PATHEXT
-  if (ORIGINAL_UNSANDBOXED === undefined) delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
-  else process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = ORIGINAL_UNSANDBOXED
+  for (const key of Object.keys(process.env)) if (!(key in original)) delete process.env[key]
+  Object.assign(process.env, original)
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
@@ -551,7 +553,7 @@ test('resolveSpawn runs a native Windows executable without cmd.exe', { skip: !I
   const binDir = join(root, 'bin')
   await mkdir(binDir)
   await writeFile(join(binDir, 'codex.exe'), '', 'utf8')
-  process.env.PATH = `${binDir};${ORIGINAL_PATH ?? ''}`
+  process.env.PATH = `${binDir};${original.PATH ?? original.Path ?? ''}`
   process.env.PATHEXT = '.EXE;.CMD;.BAT;.COM'
 
   const r = resolveSpawn('codex')
@@ -587,7 +589,7 @@ test('Codex one-shot paths send prompts through stdin', async () => {
     await writeFile(launcher, '#!/bin/sh\nexec node "$(dirname "$0")/capture.js" "$@"\n', 'utf8')
     await chmod(launcher, 0o755)
   }
-  process.env.PATH = `${binDir}${delimiter}${ORIGINAL_PATH ?? ''}`
+  process.env.PATH = `${binDir}${delimiter}${original.PATH ?? original.Path ?? ''}`
 
   const adapter = getAdapter('codex')
   const mcpShim = join(root, 'trusted', 'cumora-mcp')

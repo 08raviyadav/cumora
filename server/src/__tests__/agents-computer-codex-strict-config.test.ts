@@ -27,11 +27,12 @@ import assert from 'node:assert/strict'
 import { getAdapter } from '../agents/computer/engine.js'
 
 const IS_WIN = process.platform === 'win32'
-const ORIGINAL_PATH = process.env.PATH
+const original = { ...process.env }
 const tempDirs: string[] = []
 
 afterEach(async () => {
-  process.env.PATH = ORIGINAL_PATH
+  for (const key of Object.keys(process.env)) if (!(key in original)) delete process.env[key]
+  Object.assign(process.env, original)
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
@@ -46,6 +47,9 @@ interface Fixture { root: string; home: string; env: NodeJS.ProcessEnv }
 async function fixture(homeName: string): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), 'cumora-codex-cfg-'))
   tempDirs.push(root)
+  process.env.HOME = root
+  process.env.USERPROFILE = root
+  process.env.CODEX_HOME = join(root, 'personal-codex')
   const binDir = join(root, 'bin')
   // The reporter asked specifically for a home with ordinary separators and
   // spaces: that is where the quoting in the override has to hold up.
@@ -59,7 +63,7 @@ async function fixture(homeName: string): Promise<Fixture> {
     root, home,
     env: {
       ...process.env,
-      PATH: `${binDir}${delimiter}${ORIGINAL_PATH ?? ''}`,
+      PATH: `${binDir}${delimiter}${original.PATH ?? original.Path ?? ''}`,
       CUMORA_AGENT_IPC_DIR: join(root, 'ipc'),
       CUMORA_AGENT_MCP_SHIM: join(root, 'shim.mjs'),
     },

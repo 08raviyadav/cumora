@@ -35,6 +35,86 @@ model-generated commands.
 
 ---
 
+## Codex login and state isolation
+
+All Cumora Codex calls use `CODEX_HOME` and `CODEX_SQLITE_HOME` at
+`~/.cumora/codex-runtime/`, including triage, doctor, model discovery and
+unsandboxed compatibility mode. Personal config, memories and unrelated sessions
+stay separate. Model calls set `memories.generate_memories=false`
+and `memories.use_memories=false` to disable Codex's native memory; agents keep
+using Cumora's memory files.
+
+When the runtime has no independent login, Cumora reuses the personal
+`CODEX_HOME/auth.json` (default `~/.codex/auth.json`) through a hard link.
+Both clients refresh the same credential file. Before each new process or idle
+agent turn, Cumora follows replacement, account changes and logout in the
+personal home. A changed login restarts an idle app-server with its saved thread
+ID; an active turn finishes first. Existing independent runtime credentials
+are preserved.
+
+Sharing requires file-backed credentials on the same filesystem. If the personal
+login exists only in the OS keyring, or the filesystem cannot create hard links,
+sign in separately for Cumora:
+
+```sh
+cumora agent computer --codex-login
+```
+
+The command runs `codex login` on Windows, macOS and Linux; authentication
+errors and `--doctor` also point to it. While authentication is linked, logging
+in updates the shared personal credentials too. Use personal Codex to log out
+of the shared account. Account quota is shared. Codex still owns token refresh
+and recovery; a revoked or unrefreshable login requires signing in again.
+The persistent app-server and model discovery read the runtime's `config.toml`;
+add any needed `model` or
+`model_providers` settings there. Secure `exec` ignores user config.
+
+Main threads resume after daemon restarts: macOS/Linux use app-server, while
+Windows and app-server fallbacks use `exec --json` / `exec resume <thread-id>`.
+Triage and doctor use ephemeral sessions.
+
+**Upgrading existing agents:** file-backed personal logins are reused automatically;
+use the command above only when separate authentication is needed. Before starting
+each Codex runner, the daemon automatically migrates the thread referenced by
+`~/.cumora/sessions/<agent-id>/codex.session` from the old `CODEX_HOME`
+(default `~/.codex`), preserving its ID.
+
+- Revised and compressed rollouts and paginated ancestors are supported.
+  Only each ancestor's referenced prefix is copied; compressed prefixes become
+  plain JSONL. Personal credentials, databases and unrelated history stay put.
+- An existing state database selects the rollout through a read-only lookup,
+  which requires Node.js 22.13 or newer. Older Node.js preserves the pointer
+  and reports how to retry. Unarchive a current archived thread in its old home first.
+- Files publish atomically without replacing runtime history or newer pointers.
+  The new pointer is `codex.runtime.session`; the old one becomes
+  `codex.session.migrated`. Repeated migration leaves current sessions alone.
+- Missing, unreadable or incomplete state pauses only the affected agent and
+  preserves its old pointer. Each sync retries; unchanged errors log once per
+  process, and pending conversations receive a failure notice. Restore the
+  rollout to recover automatically, without restarting the daemon.
+
+If the daemon no longer knows a customized old home, retry manually:
+
+```sh
+CODEX_HOME=/path/to/original/codex-home cumora agent computer --migrate-codex-sessions
+```
+
+In PowerShell:
+
+```powershell
+$env:CODEX_HOME = 'C:\path\to\original\codex-home'
+cumora agent computer --migrate-codex-sessions
+```
+
+Use the original home as the source, not `~/.cumora/codex-runtime`; omit
+`CODEX_HOME` for `~/.codex`. The manual command attempts all agents and reports
+partial failures with a nonzero exit. After signing in, wake agents again to
+clear authentication failures.
+
+Migration leaves personal history and previously generated memories in place;
+review them through personal Codex separately. To start an old agent fresh,
+move its `codex.session` pointer aside while the daemon is stopped.
+
 ## The Computer — the unifying host concept
 
 Rather than bolt BYOA on as a special case, **Computer** is a first-class
@@ -164,8 +244,9 @@ selected engine's sandbox.
    roster. The invariant scaffold (CLI usage, the shared
    `GLANCE_YIELD_RULES`, memory rules, privacy boundary) is delivered
    once per persistent session out-of-band — `--append-system-prompt-file`
-   for Claude. Secure-default Codex uses a one-shot `exec` because its
-   app-server currently cannot exclude user config, MCP, hook, and rule layers.
+   for Claude and `developerInstructions` for Codex's persistent app-server.
+   Codex uses a dedicated state directory; Windows and explicit opt-outs use
+   the one-shot `exec` fallback.
    Compatibility engines retain their native standing-prompt behavior only
    after the operator explicitly enables unsandboxed BYOA.
 6. The engine reads its home (`CLAUDE.md` / `AGENTS.md`, skills,
@@ -304,7 +385,8 @@ fail-closed host boundary:
   `ANTHROPIC_BASE_URL` that won't parse is (it fails toward "custom"). Claude
   Code 2.1.248 or newer is required. Linux/WSL2 also requires `bubblewrap` and
   `socat`; a missing dependency fails the turn.
-- Codex runs one-shot with user config and exec-policy rules ignored. A custom
+- Codex uses an isolated runtime home. Its one-shot fallback ignores user
+  config and exec-policy rules. A custom
   permission profile permits minimal runtime reads and writes only under the
   agent home, disables command network, and gives model-spawned commands only
   an explicit non-secret environment. Hooks, apps, remote plugins, multi-agent
@@ -325,8 +407,8 @@ server assignment cannot make one execute accidentally.
 CUMORA_BYOA_ALLOW_UNSANDBOXED=1 cumora agent computer
 ```
 
-This opt-in also re-enables `CUMORA_*_ARGS` whole-argv overrides and Codex's
-persistent app-server path. Without it, opaque engine arguments are ignored
+This opt-in also re-enables `CUMORA_*_ARGS` whole-argv overrides.
+Without it, opaque engine arguments are ignored
 because the daemon cannot prove that they preserve the sandbox.
 
 ### Claude reasoning and response preferences

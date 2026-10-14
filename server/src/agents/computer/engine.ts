@@ -33,6 +33,7 @@ import { stripLoneSurrogates } from '../text-safety.js'
 import { isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersionWithRetry, versionCommandInvocation } from './cli-version.js'
 import { discoverEngineModelCatalog, type EngineModelCatalog } from './model-catalog.js'
+import { CODEX_RUNTIME_CONFIG_ARGS, codexAuthFingerprint, codexRuntimeEnv } from './codex-runtime.js'
 
 const IS_WIN = process.platform === 'win32'
 
@@ -381,6 +382,24 @@ function resolveCodexSpawn(): CodexSpawn {
   return { command: node, argsPrefix: [script], shell: false, wantsStdinPrompt: false }
 }
 
+/** Interactive setup uses exactly the same home as every background call. */
+export async function loginCodexRuntime(): Promise<void> {
+  const bin = await resolveBinPath('codex')
+  if (!bin || !await probeLocalEngineVersionWithRetry('codex', bin)) {
+    throw new Error(bin
+      ? 'Codex CLI was found on PATH, but its version could not be verified. Check `codex --version`, then rerun `cumora agent computer --codex-login`.'
+      : 'Codex CLI is unavailable on PATH. Install it with `npm install -g @openai/codex`, then rerun `cumora agent computer --codex-login`.')
+  }
+  const { command, shell, argsPrefix } = resolveCodexSpawn()
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, [...argsPrefix, 'login'], {
+      env: codexRuntimeEnv(), stdio: 'inherit', shell,
+    })
+    child.once('error', reject)
+    child.once('close', code => code === 0 ? resolve() : reject(new Error(`Codex login exited with code ${code}`)))
+  })
+}
+
 export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode'
 
 /** The pairable engine ids, in the daemon's default detection order. */
@@ -596,7 +615,7 @@ const RESUME_NOT_FOUND_RE = new RegExp([
 
 const ENGINE_CONTEXT_OVERFLOW_RE = /context window|context length|context_length_exceeded|maximum context|reached its context|prompt is too long|input is too long|too many tokens/i
 const ENGINE_RATE_LIMIT_RE = /rate.?limit|usage limit|quota|too many requests|overloaded|over capacity|credit balance is too low/i
-const ENGINE_AUTH_RE = /not (?:logged in|authenticated|signed in)|(?:please )?(?:sign|log) ?in|unauthori[sz]ed|forbidden|invalid (?:api )?key|authentication failed/i
+const ENGINE_AUTH_RE = /not (?:logged in|authenticated|signed in)|(?<![\w./\\-])(?:sign|log)[ -]?in(?![\w/\\-]|\.\w)|\brun \/login(?![\w/\\-]|\.\w)|unauthori[sz]ed|forbidden|invalid (?:api )?key|authentication failed/i
 const ENGINE_TRANSPORT_RE = /ECONN(?:RESET|REFUSED)|EPIPE|socket hang up|network|connection (?:closed|lost|terminated|timed out)|transport|process (?:exited|terminated)|failed to (?:spawn|write)/i
 
 export function classifyEngineFailure(diagnostic: string, hadResume = false): EngineFailureKind {
@@ -1915,18 +1934,8 @@ export function noteCodexConfigRejection(err: string | undefined, onLog?: (line:
   return true
 }
 
-/** The `-c` sandbox profile without the `exec`-only tail, so the persistent
- *  app-server path is confined by exactly the same profile as the one-shot path.
- *  This is the set production has since run clean: zero config rejections across
- *  every turn on 0.11.1 daemons. */
+/** Shared sandbox profile for exec, persistent sessions and wake probes. */
 function codexSecureConfigOverrides(args: { home: string; env: NodeJS.ProcessEnv }, readOnly = false): string[] {
-  const full = codexSecureExecArgs(args, readOnly)
-  const exec = full.indexOf('exec')
-  // Everything before `-a never exec …` is the config profile.
-  return exec === -1 ? full : full.slice(0, Math.max(0, exec - 2))
-}
-
-function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, readOnly = false): string[] {
   const workspaceAccess = readOnly ? 'read' : 'write'
   const filesystemEntries = [
     '":minimal"="read"',
@@ -1975,7 +1984,11 @@ function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, rea
     const mcp = `mcp_servers.cumora={command=${tomlString(process.execPath)},args=[${tomlString(mcpShim)}],env={CUMORA_AGENT_IPC_DIR=${tomlString(ipcDir)}},required=true,enabled_tools=["cli"],default_tools_approval_mode="approve"}`
     secureArgs.push('-c', mcp)
   }
-  return [...secureArgs, '-a', 'never', 'exec', '--ignore-user-config', '--ignore-rules']
+  return secureArgs
+}
+
+function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, readOnly = false): string[] {
+  return [...codexSecureConfigOverrides(args, readOnly), '-a', 'never', 'exec', '--ignore-user-config', '--ignore-rules']
 }
 
 /** A persistent Codex session over the app-server JSON-RPC protocol
@@ -1987,6 +2000,8 @@ function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, rea
  *  serially; each resolves on that turn's `turn/completed`. */
 class CodexSession implements EngineSession {
   private readonly child: ChildProcess
+  private readonly authHome: string
+  private readonly authFingerprint: string | null | undefined
   private readonly onLog: (line: string) => void
   private readonly onHopUsage?: (r: EngineHopReport) => void
   /** Wall-clock when the CURRENT turn started (turn/start request sent), used to
@@ -2018,6 +2033,8 @@ class CodexSession implements EngineSession {
   private turnStart = { input: 0, cached: 0, output: 0 }
 
   constructor(bin: string, spawnArgs: string[], home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
+    this.authHome = env.CODEX_HOME!
+    this.authFingerprint = codexAuthFingerprint(this.authHome)
     this.onLog = opts.onLog
     this.onHopUsage = opts.onHopUsage
     this.threadId = opts.resumeSessionId ?? null
@@ -2046,7 +2063,18 @@ class CodexSession implements EngineSession {
     queueMicrotask(() => { this.initializeId = this.req('initialize', { clientInfo: { name: 'cumora-daemon', version: '1.0.0' }, capabilities: { experimentalApi: true } }) })
   }
 
-  get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
+  get alive(): boolean {
+    if (this.exited || this.child.stdin?.writable !== true) return false
+    if (!this.pending) {
+      const auth = codexAuthFingerprint(this.authHome)
+      if (auth !== undefined && auth !== this.authFingerprint) {
+        this.onLog('[codex] login changed; restarting the session with its saved thread')
+        void this.stop({ force: true })
+        return false
+      }
+    }
+    return true
+  }
   get sessionId(): string | null { return this.threadId }
 
   send(prompt: string): Promise<EngineRunResult> {
@@ -2265,38 +2293,23 @@ class CodexAdapter implements EngineAdapter {
   readonly bin = 'codex'
 
   classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
-    // Codex on a ChatGPT account can't pick an arbitrary small model
-    // (`gpt-5-mini` is rejected), but it DOES accept `gpt-5.4-mini` — Cumora's
-    // support tier — so that's the local cerebellum here. Cheap model, no big
-    // brain, no cloud. Override with CUMORA_TRIAGE_MODEL if your codex auth has
-    // a different small model.
+    // gpt-5.4-mini works with ChatGPT auth; arbitrary small API models do not.
     const flags = allowUnsandboxedByoa() ? extraArgs('CUMORA_TRIAGE_ARGS') : []
-    const model = ['--model', args.model || 'gpt-5.4-mini']
-    const { command, shell, argsPrefix } = resolveCodexSpawn()
-    const codexArgs = flags.length
-      ? ['exec', ...flags, '-']
-      : allowUnsandboxedByoa()
-        ? ['exec', ...model, '--skip-git-repo-check', '-']
-        : [...codexSecureExecArgs({ home: args.cwd, env: args.env }, true), ...model, '--skip-git-repo-check', '-']
-    const argv = [...argsPrefix, ...codexArgs]
-    return spawnCapture(command, argv, {
-      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
-      stdinText: args.prompt,
-    })
+    return this.capture(args, flags.length ? flags : ['--model', args.model || 'gpt-5.4-mini', '--skip-git-repo-check'])
   }
 
   probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
-    // 'small' → gpt-5.4-mini (the cerebellum); 'big' → omit --model so Codex uses
-    // its default model. `exec` non-interactive, no bypass/sandbox flags needed
-    // for a tool-free one-token reply.
+    // Omit --model for the big tier so Codex uses its configured default.
     const model = args.tier === 'small' ? ['--model', triageModel('gpt-5.4-mini')] : []
+    return this.capture({ ...args, prompt: DOCTOR_PROMPT }, [...model, '--skip-git-repo-check'])
+  }
+
+  private capture(args: EngineClassifyArgs, flags: string[]): Promise<EngineClassifyResult> {
+    const env = codexRuntimeEnv(args.env)
     const { command, shell, argsPrefix } = resolveCodexSpawn()
-    const codexArgs = allowUnsandboxedByoa()
-      ? ['exec', ...model, '--skip-git-repo-check', '-']
-      : [...codexSecureExecArgs({ home: args.cwd, env: args.env }, true), ...model, '--skip-git-repo-check', '-']
-    const argv = [...argsPrefix, ...codexArgs]
-    return spawnCapture(command, argv, {
-      cwd: args.cwd, env: args.env, signal: args.signal, shell, stdinText: DOCTOR_PROMPT,
+    const exec = allowUnsandboxedByoa() ? ['exec'] : codexSecureExecArgs({ home: args.cwd, env }, true)
+    return spawnCapture(command, [...argsPrefix, ...exec, '--ephemeral', ...flags, ...CODEX_RUNTIME_CONFIG_ARGS, '-'], {
+      cwd: args.cwd, env, signal: args.signal, onLog: args.onLog, shell, stdinText: args.prompt,
     })
   }
 
@@ -2305,12 +2318,12 @@ class CodexAdapter implements EngineAdapter {
     // any of these is true, the wake path collapses to `codex exec ...` which
     // probe() already covers — running the JSON-RPC probe would just add a false
     // signal. Mark skipped and let doctor hide the line.
-    if (!allowUnsandboxedByoa()
-        || unsafeEngineArgs('CUMORA_CODEX_ARGS').length
+    if (unsafeEngineArgs('CUMORA_CODEX_ARGS').length
         || process.env.CUMORA_CODEX_NO_APP_SERVER === '1'
         || IS_WIN) {
       return Promise.resolve({ ok: true, detail: '', skipped: true })
     }
+    args = { ...args, env: codexRuntimeEnv(args.env) }
     // The real wake spawns `codex app-server --listen stdio://` and drives a
     // JSON-RPC handshake (initialize → thread/start). The realistic breaks here
     // are: app-server subcommand removed/renamed; protocol field names changed
@@ -2330,7 +2343,8 @@ class CodexAdapter implements EngineAdapter {
         try { child.stdin?.end() } catch { /* ignore */ }
         void terminateEngineTree(child).then(() => resolve(r))
       }
-      const appServerArgs = [...argsPrefix, 'app-server', '--listen', 'stdio://']
+      const secure = allowUnsandboxedByoa() ? [] : codexSecureConfigOverrides({ home: args.cwd, env: args.env }, true)
+      const appServerArgs = [...argsPrefix, ...secure, ...CODEX_RUNTIME_CONFIG_ARGS, 'app-server', '--listen', 'stdio://']
       const child = spawnEngineChild(command, appServerArgs, {
         cwd: args.cwd, env: args.env, stdio: ['pipe', 'pipe', 'pipe'], shell,
       })
@@ -2373,7 +2387,7 @@ class CodexAdapter implements EngineAdapter {
             // params shape CodexSession uses — so a field-name break shows up.
             writeRpc({ jsonrpc: '2.0', method: 'initialized', params: {} })
             writeRpc({ jsonrpc: '2.0', id: threadId, method: 'thread/start',
-              params: { cwd: args.cwd, ...codexThreadSecurityParams(), experimentalRawEvents: true } })
+              params: { cwd: args.cwd, ...codexThreadSecurityParams(), experimentalRawEvents: true, ephemeral: true } })
             continue
           }
           if (initialized && !threadAcked && msg.id === threadId && msg.result) {
@@ -2408,58 +2422,63 @@ class CodexAdapter implements EngineAdapter {
     // filesystem/network/environment profile and reaches Cumora only through
     // local IPC. Historical full-access flags and argv overrides remain
     // available exclusively behind the explicit compatibility opt-in.
+    args = { ...args, env: codexRuntimeEnv(args.env) }
     const flags = unsafeEngineArgs('CUMORA_CODEX_ARGS')
     const base = flags.length
       ? ['exec', ...flags]
       : allowUnsandboxedByoa()
         ? ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check']
         : [...codexSecureExecArgs(args), '--skip-git-repo-check']
+    if (!base.includes('--json')) base.push('--json')
     const model = args.model ? ['--model', args.model] : []
+    const resume = args.resumeSessionId ? ['resume', args.resumeSessionId] : []
     const { command, shell, argsPrefix } = resolveCodexSpawn()
-    return spawnEngine(command, [...argsPrefix, ...base, ...model, '-'], args, { shell, stdinText: args.prompt })
+    let sessionId = args.resumeSessionId ?? null
+    let usage: EngineUsage | undefined
+    let turnError: string | undefined
+    const started = Date.now()
+    return spawnEngine(command, [...argsPrefix, ...base, ...model, ...CODEX_RUNTIME_CONFIG_ARGS, ...resume, '-'], args, {
+      shell, stdinText: args.prompt,
+      onStdoutLine(line) {
+        let event
+        try { event = JSON.parse(line) } catch { return }
+        if (event?.type === 'thread.started' && typeof event.thread_id === 'string' && event.thread_id) sessionId = event.thread_id
+        if (event?.type === 'turn.failed') turnError = String(event.error?.message || 'codex turn failed')
+        if (event?.type !== 'turn.completed' || !event.usage) return
+        const { input_tokens: input, cached_input_tokens: cached = 0, output_tokens: output } = event.usage
+        if (![input, cached, output].every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0)) return
+        usage = { input_tokens: Math.max(0, input - cached), cache_read_input_tokens: cached, output_tokens: output }
+      },
+    })
       .then((res) => {
         // A rejected -c override aborts codex before it reads the prompt, so the
         // turn fails with a config error that never mentions Cumora. Say it once.
         noteCodexConfigRejection(res.error, args.onLog)
-        // `codex exec` does not accept a thread id, so this one-shot fallback
-        // always starts fresh even if the daemon currently owns a saved id.
-        return classifyEngineResult(res, false)
+        if (usage && args.model && !turnError && res.exitCode === 0) {
+          try { args.onHopUsage?.({ model: args.model, usage, latencyMs: Date.now() - started, hopIndex: 1 }) }
+          catch { /* never break the run on a ledger error */ }
+        }
+        return classifyEngineResult({
+          ...res, sessionId, usage, model: args.model ?? res.model,
+          exitCode: turnError && res.exitCode === 0 ? 1 : res.exitCode,
+          error: res.error ?? turnError,
+        }, !!args.resumeSessionId)
       })
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
-    // Escape hatches → fall back to one-shot `codex exec` (run()): a custom-args
-    // override, an explicit opt-out, or Windows (JSON-RPC over a .cmd shell is
-    // fragile; exec is the safe path there).
-    //
-    // This used to `return null` unless BYOA was explicitly unsandboxed, because
-    // app-server has no equivalent to `exec --ignore-user-config`. The cost of
-    // that was invisible in the code: with no persistent process every codex
-    // turn is a fresh session, so agents answered each message with no memory of
-    // the one before — what users reported as the agent not remembering the
-    // previous exchange.
-    //
-    // `-c` are global flags and DO apply to app-server, so the filesystem,
-    // network, environment and feature profile below is identical on both paths.
-    // What app-server cannot exclude is a user's own ~/.codex adding EXTRA
-    // mcp_servers — a narrower gap than losing every agent's continuity, on the
-    // operator's own machine, with their own config. CUMORA_CODEX_NO_APP_SERVER=1
-    // still opts out, and a failing session degrades to one-shot (see daemon.ts).
-    if (unsafeEngineArgs('CUMORA_CODEX_ARGS').length) return null
-    if (process.env.CUMORA_CODEX_NO_APP_SERVER === '1') return null
-    if (IS_WIN) return null
+    // Windows .cmd transport, custom args and explicit opt-outs use exec resume.
+    if (unsafeEngineArgs('CUMORA_CODEX_ARGS').length
+        || process.env.CUMORA_CODEX_NO_APP_SERVER === '1'
+        || IS_WIN) return null
+    args = { ...args, env: codexRuntimeEnv(args.env) }
     try { ensureGitRepoForCodex(args.home) }
     catch (err) { args.onLog(`[codex] could not init git repo for app-server (${err instanceof Error ? err.message : String(err)}) — falling back to one-shot exec`); return null }
-    // Standing prompt rides the thread's developerInstructions (see CodexSession),
-    // approval/sandbox are set per-thread, so no global bypass flags are needed.
     const { command, argsPrefix } = resolveCodexSpawn()
-    // Confine the persistent process with the same profile the one-shot path
-    // uses. `-c` are global flags and apply to app-server too, so filesystem,
-    // network, environment and features are identical on both paths.
     const secure = allowUnsandboxedByoa()
       ? []
       : codexSecureConfigOverrides({ home: args.home, env: args.env })
-    return new CodexSession(command, [...argsPrefix, ...secure, 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
+    return new CodexSession(command, [...argsPrefix, ...secure, ...CODEX_RUNTIME_CONFIG_ARGS, 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
   }
 }
 
