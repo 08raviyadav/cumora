@@ -1257,7 +1257,7 @@ api.post('/agents/:id/computer', safe(async (req, res) => {
   const modelPins = readAgentBody(req.body ?? {})
   const out = await assignAgentToComputer({
     agentId: String(req.params.id), companyId, computerId, engine, inherit: inherit || !engine,
-    model: modelPins.model, fastModel: modelPins.fastModel,
+    model: modelPins.model, fastModel: modelPins.fastModel, nativeFastMode: modelPins.nativeFastMode,
     providerProfile: readProviderProfile(req.body?.providerProfile),
   })
   if (!out) throw new HttpError(400, 'invalid computer, agent, engine, or provider profile for this company')
@@ -2495,14 +2495,14 @@ api.get('/participants', async (req, res) => {
     systemPrompt: string | null; model: string | null
     email: string | null; companySlug: string | null
     departedAt: string | null
-    computerId: string | null; engine: string | null; fastModel: string | null; providerProfile: string | null
+    computerId: string | null; engine: string | null; fastModel: string | null; providerProfile: string | null; nativeFastMode: boolean
     engineInherit: boolean | null
   }>(
     `SELECT p.id, p.kind, p.name, p.role, p.initial,
             p.avatar_bg AS "avatarBg", p.avatar_url AS "avatarUrl",
             p.status, p.status_updated_at AS "statusUpdatedAt",
             p.bio, p.tools, p.system_prompt AS "systemPrompt", p.model,
-            p.computer_id AS "computerId", p.engine, p.fast_model AS "fastModel", p.provider_profile AS "providerProfile",
+            p.computer_id AS "computerId", p.engine, p.fast_model AS "fastModel", p.provider_profile AS "providerProfile", p.native_fast_mode AS "nativeFastMode",
             p.engine_inherit AS "engineInherit",
             -- Email resolution differs by kind:
             --  - agents carry their own minted address on participants.email
@@ -2938,7 +2938,7 @@ interface AgentBody {
   id?: unknown; name?: unknown; role?: unknown
   systemPrompt?: unknown; bio?: unknown
   initial?: unknown; avatarBg?: unknown; avatarUrl?: unknown
-  model?: unknown; fastModel?: unknown
+  model?: unknown; fastModel?: unknown; nativeFastMode?: unknown
   tools?: unknown
 }
 function readAgentBody(b: AgentBody): {
@@ -2951,9 +2951,14 @@ function readAgentBody(b: AgentBody): {
   model?: string | null
   /** small-brain model override; same semantics as `model` */
   fastModel?: string | null
+  nativeFastMode?: boolean
   tools?: string[] | null
 } {
   const out: Record<string, unknown> = {}
+  if (b.nativeFastMode !== undefined) {
+    if (typeof b.nativeFastMode !== 'boolean') throw new HttpError(400, 'nativeFastMode must be a boolean')
+    out.nativeFastMode = b.nativeFastMode
+  }
   if (typeof b.id === 'string')           out.id = b.id.trim()
   if (typeof b.name === 'string')         out.name = b.name.trim()
   if (typeof b.role === 'string')         out.role = b.role.trim()
@@ -3013,6 +3018,7 @@ api.post('/agents', async (req, res) => {
       avatarBg: data.avatarBg,
       model: data.model,
       fastModel: data.fastModel,
+      nativeFastMode: data.nativeFastMode,
       providerProfile,
       tools: data.tools ?? undefined,
       computerId,
@@ -3128,6 +3134,7 @@ api.put('/agents/:id', async (req, res) => {
   if (data.avatarUrl !== undefined)    push('avatar_url', data.avatarUrl)   // null clears it
   if (data.model !== undefined)        push('model', data.model)             // null clears it (use default)
   if (data.fastModel !== undefined)    push('fast_model', data.fastModel)    // small-brain model; null clears
+  if (data.nativeFastMode !== undefined) push('native_fast_mode', data.nativeFastMode)
   if (data.tools !== undefined)        push('tools', JSON.stringify(data.tools))
   if (sets.length === 0) { res.status(400).json({ error: 'nothing to update' }); return }
   params.push(id, tenant)

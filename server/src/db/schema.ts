@@ -62,6 +62,7 @@ export const participants = pgTable('participants', {
   bio: text('bio'),
   tools: jsonb('tools').$type<string[] | null>(),
   systemPrompt: text('system_prompt'),
+  nativeFastMode: boolean('native_fast_mode').default(false).notNull(),
 })
 
 export const conversationCounters = pgTable(

@@ -70,6 +70,7 @@ function fromApi(p: ApiParticipant): Participant {
     model: p.model ?? null,
     providerProfile: p.providerProfile ?? null,
     fastModel: p.fastModel ?? null,
+    nativeFastMode: p.nativeFastMode ?? false,
     email: p.email ?? null,
     departedAt: p.departedAt ?? null,
     computerId: p.computerId ?? null,

@@ -34,6 +34,7 @@ import { isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettin
 import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersionWithRetry, versionCommandInvocation } from './cli-version.js'
 import { discoverEngineModelCatalog, type EngineModelCatalog } from './model-catalog.js'
 import { CODEX_RUNTIME_CONFIG_ARGS, codexAuthFingerprint, codexRuntimeEnv } from './codex-runtime.js'
+import { supportsNativeFastMode } from '../../../../shared/native-fast-mode.js'
 
 const IS_WIN = process.platform === 'win32'
 
@@ -559,6 +560,7 @@ export interface EngineRunArgs {
   /** Small-brain (cheap auxiliary) model. Claude: ANTHROPIC_SMALL_FAST_MODEL.
    *  Codex has no general fast-model knob, so it's ignored there for now. */
   fastModel?: string | null
+  nativeFastMode?: boolean
   /** Resume a prior engine session so the agent keeps continuous context
    *  across wakes (Claude: `--resume <id>`). Null/undefined → fresh session.
    *  This is what lets a BYOA agent remember its place in a running task
@@ -780,6 +782,7 @@ export interface EngineSessionArgs {
   env: NodeJS.ProcessEnv
   model?: string | null
   fastModel?: string | null
+  nativeFastMode?: boolean
   /** Resume a prior session on the FIRST spawn / after a restart (Claude:
    *  `--resume <id>`). Within a live process the session continues on its own. */
   resumeSessionId?: string | null
@@ -1538,7 +1541,7 @@ const TOOL_ENV_ALLOWLIST = new Set([
   'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'WINDIR',
 ])
 
-function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv): string {
+function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv, nativeFastMode = false): string {
   const deniedEnv = Object.keys(env)
     .filter((name) => !TOOL_ENV_ALLOWLIST.has(name.toUpperCase()) && !name.toUpperCase().startsWith('LC_'))
     .sort()
@@ -1557,6 +1560,7 @@ function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv): string
   const allowRead = [...new Set([agentHome, ...pathDirs])]
   return JSON.stringify({
     ...readClaudeUserSettings(env).turnSettings,
+    fastMode: nativeFastMode,
     permissions: {
       defaultMode: 'dontAsk',
       // Restricted mode confines file tools to the working directory. Keep the
@@ -1598,13 +1602,13 @@ function claudeSecureMcpConfig(env: NodeJS.ProcessEnv): string {
   })
 }
 
-function claudeSecureFlags(agentHome: string, env: NodeJS.ProcessEnv): string[] {
+function claudeSecureFlags(agentHome: string, env: NodeJS.ProcessEnv, nativeFastMode = false): string[] {
   return [
     '--restricted',
     '--permission-mode', 'dontAsk',
     '--tools', 'Read,Write,Edit,Glob,Grep,mcp__cumora__cli',
     '--disallowedTools', 'Bash,PowerShell,WebFetch,WebSearch',
-    '--settings', claudeSecureSettings(agentHome, env),
+    '--settings', claudeSecureSettings(agentHome, env, nativeFastMode),
     '--mcp-config', claudeSecureMcpConfig(env),
     '--strict-mcp-config',
   ]
@@ -1654,6 +1658,17 @@ function claudeTurnEnv(env: NodeJS.ProcessEnv, fastModel?: string | null): NodeJ
   return turnEnv
 }
 
+function claudeFastModeError(model: string | null | undefined, env: NodeJS.ProcessEnv, enabled: boolean): string | null {
+  if (!enabled) return null
+  let resolved = model || readClaudeUserSettings(env).defaultModel
+  if (/^opus(?:\[1m\])?$/i.test(resolved ?? '')) resolved = env.ANTHROPIC_DEFAULT_OPUS_MODEL || resolved
+  if (!supportsNativeFastMode('claude', resolved)) {
+    return 'Fast mode requires a supported Opus model; select one explicitly to avoid changing the selected model.'
+  }
+  if (env.CLAUDE_CODE_DISABLE_FAST_MODE === '1') return 'Fast mode is disabled by CLAUDE_CODE_DISABLE_FAST_MODE.'
+  return null
+}
+
 class ClaudeAdapter implements EngineAdapter {
   readonly id = 'claude' as const
   readonly bin = 'claude'
@@ -1685,7 +1700,7 @@ class ClaudeAdapter implements EngineAdapter {
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     const res = await spawnCapture(command, argv, {
       cwd: args.cwd,
-      env: { ...env, MAX_THINKING_TOKENS: '0' },
+      env: { ...env, MAX_THINKING_TOKENS: '0', CLAUDE_CODE_DISABLE_FAST_MODE: '1' },
       signal: args.signal,
       onLog: args.onLog,
       shell,
@@ -1717,7 +1732,7 @@ class ClaudeAdapter implements EngineAdapter {
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     return spawnCapture(command, argv, {
       cwd: args.cwd,
-      env: { ...env, MAX_THINKING_TOKENS: '0' },
+      env: { ...env, MAX_THINKING_TOKENS: '0', CLAUDE_CODE_DISABLE_FAST_MODE: '1' },
       signal: args.signal,
       shell,
       stdinText: wantsStdinPrompt ? DOCTOR_PROMPT : undefined,
@@ -1752,7 +1767,7 @@ class ClaudeAdapter implements EngineAdapter {
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     const r = await spawnCapture(command, argv, {
       cwd: args.cwd,
-      env: { ...env, MAX_THINKING_TOKENS: '0' },
+      env: { ...env, MAX_THINKING_TOKENS: '0', CLAUDE_CODE_DISABLE_FAST_MODE: '1' },
       signal: args.signal,
       shell,
       stdinText: wantsStdinPrompt ? DOCTOR_PROMPT : undefined,
@@ -1790,6 +1805,12 @@ class ClaudeAdapter implements EngineAdapter {
     const flags = unsafeEngineArgs('CUMORA_CLAUDE_ARGS')
     const model = args.model ? ['--model', args.model] : []
     const env = claudeTurnEnv(args.env, args.fastModel)
+    const fastMode = args.nativeFastMode ?? false
+    if (fastMode && flags.length) return Promise.resolve({ exitCode: 1, error: 'Fast mode requires removing the CUMORA_CLAUDE_ARGS override so Cumora can preserve the selected model and settings.' })
+    if (!fastMode) env.CLAUDE_CODE_DISABLE_FAST_MODE = '1'
+    const fastModeError = claudeFastModeError(args.model, env, fastMode)
+    if (fastModeError) return Promise.resolve({ exitCode: 1, error: fastModeError })
+    const speed = ['--settings', JSON.stringify({ fastMode })]
     // Continuous context across wakes: resume the agent's prior session so it
     // remembers the running task (its place in a counting relay, what it already
     // said) instead of re-deriving from a frozen inbox snapshot each time.
@@ -1800,8 +1821,8 @@ class ClaudeAdapter implements EngineAdapter {
     const base = flags.length
       ? [...flags, ...resume, '-p']
       : allowUnsandboxedByoa(env)
-        ? ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
-        : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', ...claudeSecureFlags(args.home, env)]
+        ? ['-p', ...resume, ...model, ...speed, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
+        : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', ...claudeSecureFlags(args.home, env, fastMode)]
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     // Agent turns can be substantial engineering/design work. Preserve the
     // operator's reasoning preferences; only triage/doctor force thinking off.
@@ -1815,6 +1836,8 @@ class ClaudeAdapter implements EngineAdapter {
     if (unsafeEngineArgs('CUMORA_CLAUDE_ARGS').length) return null
     const model = args.model ? ['--model', args.model] : []
     const env = claudeTurnEnv(args.env, args.fastModel)
+    const fastMode = args.nativeFastMode ?? false
+    if (claudeFastModeError(args.model, env, fastMode)) return null
     // --resume only on the FIRST spawn / after a restart, to continue a prior
     // session; inside a live process the session continues on its own.
     const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
@@ -1831,11 +1854,11 @@ class ClaudeAdapter implements EngineAdapter {
     const argv = allowUnsandboxedByoa(env)
       ? [
           '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-          ...resume, ...sys, ...model, '--dangerously-skip-permissions',
+          ...resume, ...sys, ...model, '--settings', JSON.stringify({ fastMode }), '--dangerously-skip-permissions',
         ]
       : [
           '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-          ...resume, ...sys, ...model, ...claudeSecureFlags(args.home, env),
+          ...resume, ...sys, ...model, ...claudeSecureFlags(args.home, env, fastMode),
         ]
     return new ClaudeSession(this.bin, argv, { ...args, env }, carriesStanding)
   }
@@ -1872,6 +1895,10 @@ const CODEX_SECURE_CONFIG_ARGS = [
   '-c', 'shell_environment_policy.inherit="none"',
   '-c', 'shell_environment_policy.ignore_default_excludes=false',
 ]
+
+function codexServiceTierArgs(enabled: boolean): string[] {
+  return ['-c', `service_tier="${enabled ? 'fast' : 'default'}"`, ...(enabled ? ['-c', 'features.fast_mode=true'] : [])]
+}
 
 function codexThreadSecurityParams(): Record<string, unknown> {
   return allowUnsandboxedByoa()
@@ -2049,6 +2076,7 @@ class CodexSession implements EngineSession {
     }
     if (opts.standingPrompt) params.developerInstructions = opts.standingPrompt
     if (opts.model) params.model = opts.model
+    params.serviceTier = opts.nativeFastMode ? 'fast' : 'default'
     this.baseThreadParams = params
     this.threadWasResume = !!opts.resumeSessionId
     this.threadReq = opts.resumeSessionId
@@ -2308,7 +2336,7 @@ class CodexAdapter implements EngineAdapter {
     const env = codexRuntimeEnv(args.env)
     const { command, shell, argsPrefix } = resolveCodexSpawn()
     const exec = allowUnsandboxedByoa() ? ['exec'] : codexSecureExecArgs({ home: args.cwd, env }, true)
-    return spawnCapture(command, [...argsPrefix, ...exec, '--ephemeral', ...flags, ...CODEX_RUNTIME_CONFIG_ARGS, '-'], {
+    return spawnCapture(command, [...argsPrefix, ...exec, '--ephemeral', ...flags, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(false), '-'], {
       cwd: args.cwd, env, signal: args.signal, onLog: args.onLog, shell, stdinText: args.prompt,
     })
   }
@@ -2437,7 +2465,7 @@ class CodexAdapter implements EngineAdapter {
     let usage: EngineUsage | undefined
     let turnError: string | undefined
     const started = Date.now()
-    return spawnEngine(command, [...argsPrefix, ...base, ...model, ...CODEX_RUNTIME_CONFIG_ARGS, ...resume, '-'], args, {
+    return spawnEngine(command, [...argsPrefix, ...base, ...model, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(args.nativeFastMode ?? false), ...resume, '-'], args, {
       shell, stdinText: args.prompt,
       onStdoutLine(line) {
         let event
@@ -2478,7 +2506,7 @@ class CodexAdapter implements EngineAdapter {
     const secure = allowUnsandboxedByoa()
       ? []
       : codexSecureConfigOverrides({ home: args.home, env: args.env })
-    return new CodexSession(command, [...argsPrefix, ...secure, ...CODEX_RUNTIME_CONFIG_ARGS, 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
+    return new CodexSession(command, [...argsPrefix, ...secure, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(args.nativeFastMode ?? false), 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
   }
 }
 

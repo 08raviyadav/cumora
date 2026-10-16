@@ -9,6 +9,8 @@ import { Input } from '@/components/Input'
 import { TextArea } from '@/components/TextArea'
 import { Select } from '@/components/Select'
 import { Combobox, type ComboboxOption } from '@/components/Combobox'
+import { Checkbox } from '@/components/Checkbox'
+import { supportsNativeFastMode } from '../../shared/native-fast-mode'
 import type { Participant, EngineId } from '@/types'
 import { useT } from '@/lib/i18n'
 import { engineLabel } from '@/lib/engines'
@@ -60,6 +62,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const [providerProfile, setProviderProfile] = useState(agent?.providerProfile ?? '')
   const [model, setModel] = useState(agent?.model ?? '')
   const [fastModel, setFastModel] = useState(agent?.fastModel ?? '')
+  const [nativeFastMode, setNativeFastMode] = useState(agent?.nativeFastMode ?? false)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [avatarUrl, setAvatarUrl] = useState<string | null>(agent?.avatarUrl ?? null)
@@ -111,6 +114,10 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const engineDefaults = providerProfile ? undefined : selectedComputer?.engineDefaults?.[selectedEngineId]
   const engineDefaultModel = engineDefaults?.model ?? undefined
   const engineDefaultFastModel = engineDefaults?.fastModel ?? undefined
+  const effectiveModel = model.trim() || engineDefaultModel || modelCatalog?.defaultModel
+  const showNativeFastMode = isByoa && (selectedEngineId === 'codex' || selectedEngineId === 'claude')
+  const nativeFastModeSupported = supportsNativeFastMode(selectedEngineId, effectiveModel)
+    && modelCatalog?.models.find((option) => option.id === effectiveModel)?.supportsFastMode !== false
   const modelOptions: Array<ComboboxOption<string>> = [
     {
       value: '',
@@ -180,11 +187,11 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     else if (!isFreeTier && cloud) { setComputerId(cloud.id); setEngineChoice(INHERIT_ENGINE) }
   }, [cloud, firstByoa, computerId, isFreeTier])
 
-  // Model ids belong to the selected local engine/account. Do not carry a pin
-  // across a host or engine switch where the new CLI may reject it.
+  // Model pins and paid speed preferences belong to the selected engine/account.
   const clearModelPins = (): void => {
     setModel('')
     setFastModel('')
+    setNativeFastMode(false)
   }
 
   const changeComputer = (id: string): void => {
@@ -221,11 +228,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
         name, role, systemPrompt, bio, avatarBg,
         model: model.trim() || null,
         fastModel: fastModel.trim() || null,
+        nativeFastMode: showNativeFastMode && nativeFastModeSupported && nativeFastMode,
       }
       // A host/engine change persists these pins in the assignment's single
       // SQL UPDATE. Do not clear them earlier if that assignment may fail.
       const profilePayload = assignmentChanged
-        ? { ...payload, model: undefined, fastModel: undefined }
+        ? { ...payload, model: undefined, fastModel: undefined, nativeFastMode: undefined }
         : payload
       let agentId = agent?.id
       if (editing) {
@@ -261,6 +269,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           model.trim() || null,
           fastModel.trim() || null,
           providerProfile || null,
+          payload.nativeFastMode,
         )
         if (isByoaTarget && pinned && out.engine !== pinned) {
           throw new Error(t('agent.enginePinRejected', { engine: engineLabel(pinned) }))
@@ -419,6 +428,18 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
               />
             )}
           </Field>
+
+          {showNativeFastMode && (
+            <Checkbox
+              checked={nativeFastModeSupported && nativeFastMode}
+              onCheckedChange={setNativeFastMode}
+              disabled={!nativeFastModeSupported}
+              label={t('agent.nativeFastModeLabel')}
+              description={!nativeFastModeSupported
+                ? t(selectedEngineId === 'claude' ? 'agent.nativeFastModeClaudeUnsupported' : 'agent.nativeFastModeUnsupported')
+                : t(selectedEngineId === 'claude' ? 'agent.nativeFastModeClaudeHint' : 'agent.nativeFastModeCodexHint')}
+            />
+          )}
 
           {isByoa && (!modelCatalog || modelCatalog.fastModelScope === 'agent') && (
             <Field

@@ -12,6 +12,7 @@ export interface EngineModelOption {
   label: string
   description?: string | null
   recommendedFor?: Array<'big' | 'small'>
+  supportsFastMode?: boolean
 }
 
 /** Model choices advertised by the daemon that actually owns the CLI login.
@@ -169,6 +170,7 @@ function mergeModels(discovered: EngineModelOption[], fallback: EngineModelOptio
       label: clean(model.label, 160) ?? id,
       description: clean(model.description, 320),
       recommendedFor: model.recommendedFor?.filter((tier): tier is 'big' | 'small' => tier === 'big' || tier === 'small'),
+      ...(typeof model.supportsFastMode === 'boolean' ? { supportsFastMode: model.supportsFastMode } : {}),
     })
     if (out.length >= 128) break
   }
@@ -319,6 +321,7 @@ interface CodexListItem {
   displayName?: unknown
   description?: unknown
   isDefault?: unknown
+  serviceTiers?: unknown
 }
 
 function discoverCodex(command: string, env: NodeJS.ProcessEnv): Promise<{ models: EngineModelOption[]; defaultModel: string | null } | null> {
@@ -378,6 +381,9 @@ function discoverCodex(command: string, env: NodeJS.ProcessEnv): Promise<{ model
             label: clean(row.displayName, 160) ?? id,
             description: clean(row.description, 320),
             recommendedFor: row.isDefault === true ? ['big'] : undefined,
+            ...(Array.isArray(row.serviceTiers) ? {
+              supportsFastMode: row.serviceTiers.some((tier) => tier?.id === 'fast' || tier?.id === 'priority'),
+            } : {}),
           }
         }).filter((row): row is EngineModelOption => row !== null)
         const defaultModel = rows.find((row) => row.isDefault === true)

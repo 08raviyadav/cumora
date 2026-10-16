@@ -448,6 +448,33 @@ disabled may send `high` even when `xhigh` is saved. To request deeper
 reasoning, enable thinking as well as setting effort. See
 [Claude model configuration](https://code.claude.com/docs/en/model-config#adjust-effort-level).
 
+### Native Fast Mode
+
+The Agent editor offers **Fast mode** below the main model for Codex and
+Claude Code. It defaults to off, is saved per Agent, and leaves the main model,
+auxiliary model and reasoning effort unchanged. Saving a changed preference
+replaces the runner and resumes its existing engine session where supported.
+
+Codex receives `serviceTier: "fast"` on thread start/resume and
+`-c service_tier="fast" -c features.fast_mode=true` on one-shot execution,
+including Windows and transport fallback. Off explicitly selects `default` so
+local configuration or a resumed thread cannot re-enable Fast Mode. The model
+picker honors Fast Mode capabilities advertised by Codex's local model catalog.
+
+Claude receives `fastMode: true/false` merged into the existing inline
+`--settings` policy. Only the `opus` alias and currently supported Opus 4.8,
+5 and 5.5 model IDs are accepted; unknown provider aliases must use a supported
+explicit model ID. The daemon also checks Opus alias remapping before launch
+to prevent Claude from silently changing an unsupported model. Native Fast
+Mode requires removing a `CUMORA_CLAUDE_ARGS` whole-argv override.
+
+Model and account eligibility still come from the provider. Codex Fast Mode
+increases quota consumption or cost; Claude subscription users need paid usage
+credits and organization permission where applicable. See
+[Codex speed](https://learn.chatgpt.com/docs/agent-configuration/speed) and
+[Claude Fast Mode](https://code.claude.com/docs/en/fast-mode) for current
+availability and billing. Triage and doctor calls keep Fast Mode disabled.
+
 ### Running against a custom provider
 
 Custom providers (CC Switch and friends) often store their endpoint,

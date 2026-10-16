@@ -22,6 +22,7 @@ const { engineDefaultsChecksum } = await import('../db/migrations/0007-engine-de
 const { agentProviderProfileChecksum } = await import('../db/migrations/0008-agent-provider-profile.js')
 const { agentRoutingClaimsChecksum } = await import('../db/migrations/0009-agent-routing-claims.js')
 const { boardCardDueOnChecksum } = await import('../db/migrations/0010-board-card-due-on.js')
+const { agentNativeFastModeChecksum } = await import('../db/migrations/0011-agent-native-fast-mode.js')
 const { verifySchemaCompatibility } = await import('../db/schema-version.js')
 type SchemaVersionQueryable = import('../db/schema-version.js').SchemaVersionQueryable
 
@@ -65,6 +66,10 @@ test('the agent routing claims migration matches its immutable manifest checksum
 
 test('the board card due date migration matches its immutable manifest checksum', () => {
   assert.equal(boardCardDueOnChecksum(), SCHEMA_MIGRATIONS[9].checksum)
+})
+
+test('the native Fast Mode migration matches its immutable manifest checksum', () => {
+  assert.equal(agentNativeFastModeChecksum(), SCHEMA_MIGRATIONS[10].checksum)
 })
 
 test('the migration owner accepts an exact prefix and reports its pending suffix', () => {

@@ -200,6 +200,7 @@ function sanitizeModelCatalog(raw: unknown): EngineModelCatalog | undefined {
         label: displayString(model.label, 160) ?? id,
         description: displayString(model.description, 320),
         ...(recommendedFor?.length ? { recommendedFor } : {}),
+        ...(typeof model.supportsFastMode === 'boolean' ? { supportsFastMode: model.supportsFastMode } : {}),
       })
     }
   }
@@ -756,16 +757,17 @@ export async function mintAgentRuntimeToken(args: {
  *  provider can explicitly make its unnamed local default authoritative so a
  *  vendor-specific deploy pin never crosses into the wrong namespace. */
 export async function listAgentsForComputer(computerId: string, supportsProviderProfiles = false): Promise<
-  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; providerProfile: string | null }>
+  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; providerProfile: string | null; nativeFastMode: boolean }>
 > {
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; systemPrompt: string | null
     engine: EngineId | null; model: string | null; fastModel: string | null
     providerProfile: string | null
+    nativeFastMode: boolean
     availableEngines?: string[]; detectedEngines?: unknown; engineDefaults?: unknown
   }>(
     `SELECT p.id, p.name, p.role, p.system_prompt AS "systemPrompt", p.engine, p.model,
-            p.fast_model AS "fastModel", p.provider_profile AS "providerProfile", c.available_engines AS "availableEngines",
+            p.fast_model AS "fastModel", p.provider_profile AS "providerProfile", p.native_fast_mode AS "nativeFastMode", c.available_engines AS "availableEngines",
             COALESCE(c.detected_engines, '[]'::jsonb) AS "detectedEngines",
             COALESCE(c.engine_defaults, '{}'::jsonb) AS "engineDefaults"
        FROM participants p
@@ -1130,6 +1132,7 @@ export async function assignAgentToComputer(args: {
    *  host/engine assignment. undefined leaves the value untouched; null clears it. */
   model?: string | null
   fastModel?: string | null
+  nativeFastMode?: boolean
 }): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
   const placement = await resolveComputerAssignment({ ...args, strictEngine: true })
   if (!placement) return null
@@ -1143,6 +1146,10 @@ export async function assignAgentToComputer(args: {
   if (args.fastModel !== undefined) {
     params.push(args.fastModel)
     sets.push(`fast_model = $${params.length}`)
+  }
+  if (args.nativeFastMode !== undefined) {
+    params.push(args.nativeFastMode)
+    sets.push(`native_fast_mode = $${params.length}`)
   }
   params.push(args.providerProfile ?? null)
   sets.push(`provider_profile = $${params.length}`)

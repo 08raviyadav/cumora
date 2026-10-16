@@ -52,6 +52,7 @@ import {
   BOARD_CARD_DUE_ON_INDEX_SQL,
   boardCardDueOnChecksum,
 } from './migrations/0010-board-card-due-on.js'
+import { AGENT_NATIVE_FAST_MODE_SQL, agentNativeFastModeChecksum } from './migrations/0011-agent-native-fast-mode.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2634,6 +2635,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
       await client.query(BOARD_CARD_DUE_ON_SQL)
       await ensureConcurrentIndex(client, BOARD_CARD_DUE_ON_INDEX_NAME, BOARD_CARD_DUE_ON_INDEX_SQL)
     },
+  },
+  {
+    ...SCHEMA_MIGRATIONS[10],
+    sourceChecksum: agentNativeFastModeChecksum(),
+    transactional: true,
+    up: async (client) => { await client.query(AGENT_NATIVE_FAST_MODE_SQL) },
   },
 ]
 

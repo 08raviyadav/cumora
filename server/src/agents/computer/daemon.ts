@@ -454,6 +454,7 @@ interface AgentInfo {
   engine: EngineId | null
   model: string | null
   fastModel: string | null
+  nativeFastMode?: boolean
 }
 
 /** One line's worth of "there is a file on this message".
@@ -2028,6 +2029,7 @@ export class AgentRunner {
           env: this.engineEnv(),
           model: this.engineModel(),
           fastModel: this.engineFastModel(),
+          nativeFastMode: this.agent.nativeFastMode ?? false,
           resumeSessionId,
           onLog: (line) => this.logEngineLine(line),
           onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
@@ -2041,6 +2043,7 @@ export class AgentRunner {
         env: this.engineEnv(),
         model: this.engineModel(),
         fastModel: this.engineFastModel(),
+        nativeFastMode: this.agent.nativeFastMode ?? false,
         resumeSessionId,
         onLog: (line) => this.logEngineLine(line),
         onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
@@ -2173,6 +2176,7 @@ export class AgentRunner {
       && this.agent.systemPrompt === agent.systemPrompt
       && this.agent.model === agent.model
       && this.agent.fastModel === agent.fastModel
+      && (this.agent.nativeFastMode ?? false) === (agent.nativeFastMode ?? false)
   }
 
   private async ensureToken(signal?: AbortSignal): Promise<string> {
@@ -2281,6 +2285,7 @@ export class AgentRunner {
       env: this.engineEnv(),
       model: this.engineModel(),
       fastModel: this.engineFastModel(),
+      nativeFastMode: this.agent.nativeFastMode ?? false,
       resumeSessionId,
       standingPrompt: this.standingPrompt(),
       onLog: (line) => this.logEngineLine(line),

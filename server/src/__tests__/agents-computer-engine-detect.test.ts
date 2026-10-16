@@ -45,6 +45,19 @@ after(async () => {
   } catch { /* ignore */ }
 })
 
+test('model capability sanitization preserves explicit Fast Mode support', () => {
+  const detected = registry.sanitizeDetectedEngines([{
+    id: 'codex', modelCatalog: {
+      models: [
+        { id: 'fast', supportsFastMode: true },
+        { id: 'standard', supportsFastMode: false },
+        { id: 'unknown', supportsFastMode: 'true' },
+      ],
+    },
+  }], ['codex'])
+  assert.deepEqual(detected[0].modelCatalog?.models.map((model) => model.supportsFastMode), [true, false, undefined])
+})
+
 test('sanitizeDetectedEngines drops unknown ids and fills missing bins', () => {
   const out = registry.sanitizeDetectedEngines(
     [{ id: 'claude', bin: 'claude', path: '/usr/bin/claude' }, { id: 'bogus', bin: 'x', path: null }],
@@ -238,13 +251,14 @@ test('assignAgentToComputer persists model pins in the host assignment update', 
   })
   const out = await registry.assignAgentToComputer({
     agentId: 'bram', companyId: 'co-1', computerId: 'comp-1', engine: 'codex', inherit: false,
-    model: 'gpt-5.6-sol', fastModel: null,
+    model: 'gpt-5.6-sol', fastModel: null, nativeFastMode: true,
   })
   assert.deepEqual(out, { kind: 'local', engine: 'codex', inherit: false })
   const update = calls.find((call) => /UPDATE participants SET computer_id/.test(call.sql))
   assert.match(update?.sql ?? '', /model = \$4/)
   assert.match(update?.sql ?? '', /fast_model = \$5/)
+  assert.match(update?.sql ?? '', /native_fast_mode = \$6/)
   assert.deepEqual(update?.params, [
-    'comp-1', 'codex', false, 'gpt-5.6-sol', null, null, 'bram', 'co-1',
+    'comp-1', 'codex', false, 'gpt-5.6-sol', null, true, null, 'bram', 'co-1',
   ])
 })

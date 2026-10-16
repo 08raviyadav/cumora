@@ -227,6 +227,7 @@ export interface ApiParticipant {
   engineInherit?: boolean | null
   providerProfile?: string | null
   fastModel?: string | null
+  nativeFastMode?: boolean
 }
 
 /** A Computer (agent host) as returned by GET /api/computers. */
@@ -311,6 +312,8 @@ export interface AgentInput {
   model?: string | null
   /** per-agent small-brain (fast) model override; null clears it */
   fastModel?: string | null
+  /** Native provider speed setting, independent of either model choice. */
+  nativeFastMode?: boolean
   tools?: string[]
 }
 
@@ -1019,10 +1022,11 @@ export const api = {
     model?: string | null,
     fastModel?: string | null,
     providerProfile?: string | null,
+    nativeFastMode?: boolean,
   ) =>
     http<{ ok: boolean; kind: ComputerKind; engine: EngineId; inherit?: boolean }>(
       `/agents/${encodeURIComponent(agentId)}/computer`,
-      { method: 'POST', body: JSON.stringify({ computerId, engine, inherit, model, fastModel, providerProfile }) }),
+      { method: 'POST', body: JSON.stringify({ computerId, engine, inherit, model, fastModel, providerProfile, nativeFastMode }) }),
   createAgent: (input: AgentCreateInput) =>
     http<{
       id: string

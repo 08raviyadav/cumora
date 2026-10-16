@@ -413,6 +413,74 @@ if (argv.includes('--input-format')) {
   assert.equal(cheap.argv.includes('--settings'), false)
 })
 
+test('Claude Fast Mode preserves the model, preferences, sandbox and resume on both transports', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-fast-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  const configDir = join(root, 'config')
+  await Promise.all([mkdir(binDir), mkdir(home), mkdir(configDir)])
+  await writeFile(join(configDir, 'settings.json'), JSON.stringify({ fastMode: true, effortLevel: 'xhigh' }))
+  await writeFakeCli(binDir, 'claude', `
+const argv = process.argv.slice(2)
+const reply = () => {
+  const capture = { argv, small: process.env.ANTHROPIC_SMALL_FAST_MODEL, disabled: process.env.CLAUDE_CODE_DISABLE_FAST_MODE }
+  const format = argv[argv.indexOf('--output-format') + 1]
+  if (format === 'json') process.stdout.write(JSON.stringify({ result: JSON.stringify(capture) }))
+  else if (format === 'text') process.stdout.write(JSON.stringify(capture))
+  else {
+    process.stderr.write(JSON.stringify(capture) + '\\n')
+    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', result: 'OK', session_id: 'prior-session' }) + '\\n')
+  }
+}
+if (argv.includes('--input-format')) require('node:readline').createInterface({ input: process.stdin }).on('line', reply)
+else { process.stdin.resume(); process.stdin.on('end', reply) }
+`)
+  useFakeCliPath(binDir)
+  for (const compatibility of [false, true]) {
+    if (compatibility) process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
+    else delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+    for (const nativeFastMode of [true, false]) {
+      for (const persistent of [false, true]) {
+        const logs: string[] = []
+        const args = {
+          home, env: secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_DISABLE_FAST_MODE: '0' }),
+          model: 'claude-opus-5', fastModel: 'auxiliary', nativeFastMode, resumeSessionId: 'prior-session',
+          onLog: (line: string) => logs.push(line),
+        }
+        if (persistent) {
+          const session = getAdapter('claude').startSession?.(args)
+          assert.ok(session)
+          liveSessions.push(session)
+          assert.equal((await session.send('wake')).exitCode, 0)
+          await session.stop()
+        } else {
+          assert.equal((await getAdapter('claude').run({ ...args, prompt: 'wake', signal: new AbortController().signal })).exitCode, 0)
+        }
+        const captured = JSON.parse(logs.find((line) => line.startsWith('{')) ?? '{}')
+        const argv: string[] = captured.argv
+        const settings = JSON.parse(argv[argv.indexOf('--settings') + 1])
+        assert.equal(settings.fastMode, nativeFastMode)
+        assert.equal(argv.filter((arg) => arg === '--settings').length, 1)
+        assert.equal(argv[argv.indexOf('--model') + 1], 'claude-opus-5')
+        assert.equal(argv[argv.indexOf('--resume') + 1], 'prior-session')
+        assert.equal(captured.small, 'auxiliary')
+        assert.equal(argv.includes('--effort'), false)
+        if (!compatibility) {
+          assert.equal(settings.effortLevel, 'xhigh')
+          assert.equal(settings.sandbox.enabled, true)
+          assert.equal(settings.permissions.defaultMode, 'dontAsk')
+        }
+      }
+    }
+    const env = secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir })
+    const triage = await getAdapter('claude').classify({ cwd: home, env, model: 'haiku', prompt: 'classify', signal: new AbortController().signal })
+    assert.equal(JSON.parse(triage.text).disabled, '1')
+    const doctor = await getAdapter('claude').probe({ cwd: home, env, tier: 'small', signal: new AbortController().signal })
+    assert.equal(JSON.parse(doctor.text).disabled, '1')
+  }
+})
+
 test('persistent Claude startup failure keeps stderr for first send', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-engine-session-'))
   tempDirs.push(root)
@@ -650,6 +718,20 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.equal(runCapture.argv?.some((arg) => arg.includes('dangerously')), false)
   assert.equal(runCapture.argv?.some((arg) => arg.includes('must-not-reach-tools')), false)
   assert.equal(runCapture.stdin, longPrompt)
+  assert.ok(runCapture.argv?.includes('service_tier="default"'))
+  for (const nativeFastMode of [true, false]) {
+    const speedLogs: string[] = []
+    await adapter.run({
+      home, prompt: 'wake', model: 'test-model', fastModel: 'auxiliary', nativeFastMode,
+      env: { ...process.env, CUMORA_AGENT_IPC_DIR: join(root, 'private-ipc'), CUMORA_AGENT_MCP_SHIM: mcpShim },
+      onLog: (line) => speedLogs.push(line), signal: new AbortController().signal,
+    })
+    const captured = JSON.parse(speedLogs.at(-1) ?? '{}') as { argv: string[] }
+    assert.ok(captured.argv.includes(`service_tier="${nativeFastMode ? 'fast' : 'default'}"`))
+    assert.equal(captured.argv.includes('features.fast_mode=true'), nativeFastMode)
+    assert.equal(captured.argv[captured.argv.indexOf('--model') + 1], 'test-model')
+    assert.ok(captured.argv.includes('--ignore-user-config'))
+  }
 
   const triagePrompt = 'triage prompt with spaces\nand a second line'
   const triage = await adapter.classify({
@@ -666,6 +748,7 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.ok(triageCapture.argv?.includes('triage-model'))
   assert.equal(triageCapture.argv?.at(-1), '-')
   assert.equal(triageCapture.stdin, triagePrompt)
+  assert.ok(triageCapture.argv?.includes('service_tier="default"'))
 
   const probe = await adapter.probe({
     tier: 'big',
@@ -678,6 +761,7 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.ok(probeCapture.argv?.includes('--ignore-user-config'))
   assert.equal(probeCapture.argv?.at(-1), '-')
   assert.equal(probeCapture.stdin, 'Connectivity check. Reply with exactly: OK')
+  assert.ok(probeCapture.argv?.includes('service_tier="default"'))
 })
 
 test('Claude and Codex one-shot adapters return structured engine failures', async () => {
@@ -780,6 +864,54 @@ async function startFakeCodexSession(opts: { resume?: string } = {}) {
   liveSessions.push(session!)
   return { session: session!, logs }
 }
+
+test('Codex Fast Mode reaches fresh, resumed and fallback threads without changing the model', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-codex-fast-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await Promise.all([mkdir(binDir), mkdir(home)])
+  await writeFakeCli(binDir, 'codex', `
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line)
+  const emit = result => process.stdout.write(JSON.stringify({ id: msg.id, result }) + '\\n')
+  if (msg.method === 'initialize') emit({})
+  if (msg.method === 'thread/start' || msg.method === 'thread/resume') {
+    process.stderr.write(JSON.stringify({ method: msg.method, params: msg.params, argv: process.argv.slice(2) }) + '\\n')
+    if (msg.params.threadId === 'missing-thread') process.stdout.write(JSON.stringify({ id: msg.id, error: { message: 'session not found' } }) + '\\n')
+    else emit({ thread: { id: 'fixture-thread' } })
+  }
+  if (msg.method === 'turn/start') {
+    emit({ turn: { id: 'fixture-turn' } })
+    process.stdout.write(JSON.stringify({ method: 'turn/completed', params: { turn: { id: 'fixture-turn', status: 'completed' } } }) + '\\n')
+  }
+})
+`)
+  useFakeCliPath(binDir)
+  for (const nativeFastMode of [true, false]) {
+    for (const resumeSessionId of [null, 'prior-thread', 'missing-thread']) {
+      const logs: string[] = []
+      const session = getAdapter('codex').startSession?.({
+        home, env: secureClaudeEnv(root), model: 'main-model', nativeFastMode, resumeSessionId,
+        onLog: (line) => logs.push(line),
+      })
+      assert.ok(session)
+      liveSessions.push(session)
+      assert.equal((await session.send('wake')).exitCode, 0)
+      await session.stop()
+      const requests = logs.filter((line) => line.startsWith('{')).map((line) => JSON.parse(line))
+      assert.deepEqual(requests.map((request) => request.method), resumeSessionId === 'missing-thread'
+        ? ['thread/resume', 'thread/start'] : [resumeSessionId ? 'thread/resume' : 'thread/start'])
+      for (const request of requests) {
+        assert.equal(request.params.serviceTier, nativeFastMode ? 'fast' : 'default')
+        assert.equal(request.params.model, 'main-model')
+        assert.equal(request.params.sandbox, 'workspace-write')
+        assert.equal(request.params.reasoningEffort, undefined)
+        assert.ok(request.argv.includes(`service_tier="${nativeFastMode ? 'fast' : 'default'}"`))
+      }
+    }
+  }
+})
 
 test('a Codex session whose thread never opens dies instead of wedging', { skip: IS_WIN }, async () => {
   const { session } = await startFakeCodexSession()

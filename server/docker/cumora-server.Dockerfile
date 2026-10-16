@@ -63,6 +63,7 @@ COPY package.json package-lock.json ./
 # scripts is safe in this stage AND faster than apt-get'ing bzip2.
 RUN npm ci --no-audit --no-fund --prefer-offline --ignore-scripts
 COPY src ./src
+COPY shared ./shared
 COPY public ./public
 COPY index.html ./
 COPY vite.config.ts ./
@@ -98,6 +99,7 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
 COPY server ./server
+COPY shared ./shared
 # Keep `bin/cumora` available for any in-process CLI calls the server
 # itself might make (e.g. from the test endpoints).
 COPY bin ./bin

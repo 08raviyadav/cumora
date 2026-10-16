@@ -14,6 +14,7 @@ export interface EngineModelOption {
   label: string
   description?: string | null
   recommendedFor?: Array<'big' | 'small'>
+  supportsFastMode?: boolean
 }
 
 export interface EngineModelCatalog {
@@ -102,6 +103,7 @@ export interface Participant {
   /** small-brain (fast/auxiliary) model override */
   providerProfile?: string | null
   fastModel?: string | null
+  nativeFastMode?: boolean
   /** id of the Computer this agent runs on (null/undefined = Cumora Cloud) */
   computerId?: string | null
   /** engine the agent's host runs it on ('managed' for cloud agents) */

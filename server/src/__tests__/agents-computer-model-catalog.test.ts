@@ -11,6 +11,35 @@ import { join } from 'node:path'
 import { readClaudeUserSettings, withClaudeUserSettingsEnv } from '../agents/computer/claude-user-settings.js'
 import { clearModelCatalogCache, discoverEngineModelCatalog, parseListedModels } from '../agents/computer/model-catalog.js'
 
+test('Codex discovers Fast Mode support from advertised service tiers', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-codex-tiers-'))
+  const script = join(root, 'catalog.cjs')
+  const bin = join(root, process.platform === 'win32' ? 'codex.cmd' : 'codex')
+  const rows = [
+    { model: 'fast-model', serviceTiers: [{ id: 'fast' }], isDefault: true },
+    { model: 'priority-model', serviceTiers: [{ id: 'priority' }] },
+    { model: 'standard-model', serviceTiers: [] },
+    { model: 'legacy-model' },
+  ]
+  await writeFile(script, `
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line)
+  if (msg.id) process.stdout.write(JSON.stringify({ id: msg.id, result: msg.method === 'model/list' ? { data: ${JSON.stringify(rows)} } : {} }) + '\\n')
+})
+`)
+  await writeFile(bin, process.platform === 'win32'
+    ? `@echo off\r\n"${process.execPath}" "%~dp0catalog.cjs" %*\r\n`
+    : `#!/bin/sh\nexec node "${script}" "$@"\n`, { mode: 0o755 })
+  try {
+    const catalog = await discoverEngineModelCatalog('codex', bin, true)
+    assert.equal(catalog.source, 'protocol')
+    assert.deepEqual(rows.map((row) => catalog.models.find((model) => model.id === row.model)?.supportsFastMode), [true, true, false, undefined])
+  } finally {
+    clearModelCatalogCache()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('OpenCode catalog keeps provider-qualified model ids and deduplicates them', () => {
   assert.deepEqual(
     parseListedModels('anthropic/claude-sonnet-4-6\nopenai/gpt-5.5\nanthropic/claude-sonnet-4-6\n', 'provider'),

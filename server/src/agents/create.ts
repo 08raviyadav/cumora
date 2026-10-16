@@ -32,6 +32,7 @@ export interface CreateAgentRecordInput {
   avatarBg?: string
   model?: string | null
   fastModel?: string | null
+  nativeFastMode?: boolean
   providerProfile?: string | null
   tools?: string[]
   computerId?: string | null
@@ -94,6 +95,7 @@ function creationRequestHash(input: CreateAgentRecordInput): string {
     avatarBg: input.avatarBg ?? '',
     model: input.model ?? null,
     fastModel: input.fastModel ?? null,
+    ...(input.nativeFastMode ? { nativeFastMode: true } : {}),
     ...(input.providerProfile ? { providerProfile: input.providerProfile } : {}),
     tools: input.tools ?? ['bash'],
     computerId: input.computerId ?? null,
@@ -205,10 +207,10 @@ export async function createAgentRecord(
         `INSERT INTO participants
            (id, kind, name, role, initial, avatar_bg, status, bio, tools,
             system_prompt, model, fast_model, company_id, computer_id, engine,
-            engine_inherit, creation_request_id, creation_request_hash, provider_profile)
+            engine_inherit, creation_request_id, creation_request_hash, provider_profile, native_fast_mode)
          VALUES
            ($1, 'agent', $2, $3, $4, $5, 'avail', $6, $7::jsonb,
-            $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
          ON CONFLICT DO NOTHING
          RETURNING id`,
         [
@@ -216,7 +218,7 @@ export async function createAgentRecord(
           JSON.stringify(tools), input.systemPrompt, input.model ?? null,
           input.fastModel ?? null, input.companyId, computerId,
           placement?.engine ?? null, placement?.inherit ?? true,
-          requestId, requestHash, input.providerProfile ?? null,
+          requestId, requestHash, input.providerProfile ?? null, input.nativeFastMode ?? false,
         ],
       )
       if (rows[0]) {

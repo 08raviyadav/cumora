@@ -1,8 +1,10 @@
 import { after, before, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
 import { pool } from '../db/pool.js'
 import { AgentCreationError, createAgentRecord } from '../agents/create.js'
-import { ensureSchemaOnce, resetAllTables, seedUserMembership, teardownAll } from './_helpers.js'
+import { assignAgentToComputer, listAgentsForComputer } from '../agents/computer/registry.js'
+import { buildApiTestApp, ensureSchemaOnce, resetAllTables, seedUserMembership, teardownAll } from './_helpers.js'
 
 const COMPANY_ID = 'co-agent-create'
 const OWNER_ID = 'u-agent-create'
@@ -80,6 +82,43 @@ test('[integration] concurrent Agent-create retries return one atomically assign
     engine_inherit: false,
     creation_request_id: 'agent-create-request-1',
   }])
+})
+
+test('[integration] native Fast Mode persists across creation, discovery and reassignment', async () => {
+  const createInput = input({ nativeFastMode: true })
+  const created = await createAgentRecord(createInput)
+  assert.equal((await createAgentRecord(createInput)).id, created.id)
+  await assert.rejects(createAgentRecord({ ...createInput, nativeFastMode: false }), /different agent data/)
+  assert.equal((await listAgentsForComputer(COMPUTER_ID)).find((agent) => agent.id === created.id)?.nativeFastMode, true)
+  await assignAgentToComputer({ companyId: COMPANY_ID, computerId: COMPUTER_ID, agentId: created.id, engine: 'codex', nativeFastMode: false })
+  assert.equal((await listAgentsForComputer(COMPUTER_ID)).find((agent) => agent.id === created.id)?.nativeFastMode, false)
+  const standard = await createAgentRecord(input({ requestId: 'fast-mode-default' }))
+  assert.equal((await listAgentsForComputer(COMPUTER_ID)).find((agent) => agent.id === standard.id)?.nativeFastMode, false)
+})
+
+test('[integration] the Agent API validates, updates and returns the native Fast Mode flag', async () => {
+  const created = await createAgentRecord(input())
+  const server = createServer(await buildApiTestApp(OWNER_ID))
+  await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve) })
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+  const endpoint = `http://127.0.0.1:${address.port}/api`
+  const headers = { 'content-type': 'application/json', 'x-company-id': COMPANY_ID }
+  try {
+    for (const nativeFastMode of [true, false]) {
+      const saved = await fetch(`${endpoint}/agents/${created.id}`, { method: 'PUT', headers, body: JSON.stringify({ nativeFastMode }) })
+      assert.equal(saved.status, 200)
+      const listed = await fetch(`${endpoint}/participants`, { headers })
+      const participants = await listed.json() as Array<{ id: string; nativeFastMode: boolean }>
+      assert.equal(participants.find((agent) => agent.id === created.id)?.nativeFastMode, nativeFastMode)
+    }
+    for (const invalid of ['true', 1, null]) {
+      const rejected = await fetch(`${endpoint}/agents/${created.id}`, { method: 'PUT', headers, body: JSON.stringify({ nativeFastMode: invalid }) })
+      assert.equal(rejected.status, 400)
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+  }
 })
 
 test('[integration] invalid placement rolls back without creating an Agent', async () => {
