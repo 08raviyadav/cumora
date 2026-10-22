@@ -460,6 +460,7 @@ test('daemon migrates automatically, isolates failures, deduplicates retries and
     const logError = console.error
     console.error = (...args) => { errors.push(args.join(' ')); logError(...args) }
     const connected = new Set()
+    let inventoryReported = false
     let scans = 0
     let notices = 0
     let noticeAttempts = 0
@@ -491,7 +492,8 @@ test('daemon migrates automatically, isolates failures, deduplicates retries and
       }
       if (path.endsWith('wake-stream')) connected.add(options.headers.Authorization.slice(7))
       if (path.endsWith('stream')) return new Response(new ReadableStream({ start() {} }), { headers: { 'Content-Type': 'text/event-stream' } })
-      if (path === '/api/computers/heartbeat' || path === '/api/computers/me/engines') return Response.json({})
+      if (path === '/api/computers/me/engines') { inventoryReported = true; return Response.json({}) }
+      if (path === '/api/computers/heartbeat') return Response.json({})
       throw new Error('Unexpected fixture request: ' + path)
     }
     const waitFor = async (condition) => {
@@ -523,7 +525,9 @@ test('daemon migrates automatically, isolates failures, deduplicates retries and
       assert.deepEqual(errors, [])
     }
     assert.equal(process.exitCode, undefined)
-    process.exit(0)
+    // Finish startup probes and drain runners before the parent removes their runtime directory.
+    await waitFor(() => inventoryReported)
+    process.emit('SIGTERM')
   `
   for (const recover of [true, false]) {
     const result = await execFileAsync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script(recover)], {
@@ -531,6 +535,7 @@ test('daemon migrates automatically, isolates failures, deduplicates retries and
     })
     assert.match(result.stdout, /healthy restored codex session/)
     assert.match(result.stdout, /blocked restored codex session/)
+    assert.match(result.stdout, /shutting down \(SIGTERM\)/)
     assert.doesNotMatch(result.stderr, /new-user paused:/)
     for (const [agent, thread] of agentThreads) {
       assert.equal(await new EngineSessionStore(pointers, agent, 'codex', CODEX_SESSION_SCOPE).load(), thread)
