@@ -197,6 +197,12 @@ async function waitForClosed(harness: SocketHarness, timeoutMs = 2_000): Promise
 
 async function closeAllSockets(): Promise<void> {
   await Promise.allSettled([...openSockets].map(closeSocket))
+  // Client close does not await the server's presence/outbox transaction.
+  const deadline = Date.now() + OBSERVER_QUERY_TIMEOUT_MS
+  while (wss.clients.size > 0 || pool.waitingCount > 0 || pool.idleCount !== pool.totalCount) {
+    assert.ok(Date.now() < deadline, 'timed out waiting for WebSocket disconnect cleanup')
+    await delay(10)
+  }
 }
 
 async function seedDocumentFixture(viewerCount: number): Promise<DocumentFixture> {
@@ -306,13 +312,14 @@ beforeEach(async () => {
   await resetAllTables()
 })
 
-afterEach(() => {
+afterEach(async () => {
   // rooms.ts intentionally keeps empty rooms for a 60s reconnect grace
   // period. Tests own these document ids, so evicting them here cancels those
   // timers and keeps this focused integration file from holding the runner
   // open for a full grace window.
   for (const documentId of fixtureDocumentIds) evictDocumentRoom(documentId)
   fixtureDocumentIds.clear()
+  await closeAllSockets()
 })
 
 after(async () => {
@@ -359,6 +366,39 @@ test('a contended peer is detached without discarding a valid peer', async () =>
     await barrier.query('ROLLBACK').catch(() => {})
     await barrier.end().catch(() => {})
     await Promise.allSettled([actor, target, peer].map(closeSocket))
+  }
+})
+
+test('socket cleanup waits for the disconnect presence transaction', async () => {
+  const fixture = await seedDocumentFixture(1)
+  const socket = await openSocket(ACTOR_ID)
+  const barrier = new Client({ connectionString: databaseUrl() })
+  const observer = new Client({ connectionString: databaseUrl() })
+  await barrier.connect()
+  await observer.connect()
+  let cleanup: Promise<void> | undefined
+  try {
+    await barrier.query('BEGIN')
+    await barrier.query('LOCK TABLE realtime_outbox IN ACCESS EXCLUSIVE MODE')
+    await closeSocket(socket)
+    await waitForBlockedQuery(observer, '%INSERT INTO realtime_outbox%')
+    cleanup = closeAllSockets()
+    await assert.rejects(
+      within(cleanup, 'blocked disconnect cleanup', 50),
+      /timed out waiting for blocked disconnect cleanup/,
+    )
+    await barrier.query('COMMIT')
+    await cleanup
+    const { rows } = await pool.query<{ status: string }>(
+      'SELECT status FROM participants WHERE id = $1 AND company_id = $2',
+      [ACTOR_ID, fixture.companyId],
+    )
+    assert.equal(rows[0]?.status, 'resting')
+  } finally {
+    await barrier.query('ROLLBACK').catch(() => {})
+    await barrier.end()
+    await observer.end()
+    await cleanup
   }
 })
 
