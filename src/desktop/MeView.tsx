@@ -9,13 +9,15 @@ import { usePairingCodes } from '@/stores/pairing-codes'
 import { copyText } from '@/lib/clipboard'
 import { Avatar } from '@/components/Avatar'
 import { Checkbox } from '@/components/Checkbox'
+import { Combobox } from '@/components/Combobox'
 import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
 import { LanguagePicker } from '@/components/LanguagePicker'
 import { useT, type MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { api, getPairingServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
 import { ENGINE_BIN, ENGINE_LABEL, RUNNABLE_ENGINES, RUNNABLE_ENGINE_IDS, engineLabel, type RunnableEngineId } from '@/lib/engines'
-import type { Computer, EngineId } from '@/types'
+import type { Computer, EngineId, EngineModelCatalog } from '@/types'
+import { engineModelChoices, catalogTrust } from '@/lib/engine-model-choices'
 import { ENGINE_UPDATE_TTL_SECONDS } from '../../shared/engine-update'
 
 // The tab's identity is its `key`; the label is a message key resolved at
@@ -788,6 +790,9 @@ type AgentRow = {
   outdated?: boolean
   updateCommand?: string | null
   blockedReason?: string | null
+  /** Models this computer's own CLI login can reach. Absent on daemons that
+   *  predate catalog reporting, which is why the picker keeps custom entry. */
+  modelCatalog?: EngineModelCatalog
 }
 
 const CLI_ORDER = [
@@ -1266,34 +1271,60 @@ function ComputersTab() {
                               <div className="mt-3 pt-3" style={{ borderTop: '1px dashed var(--ink-100)' }}>
                                 {editingModel?.computerId === c.id && editingModel?.engineId === row.id ? (
                                   <div className="space-y-2">
-                                    <div className="text-[11px] font-semibold text-ink-600 uppercase tracking-wider">
+                                    {/* No `uppercase`: the engine name is a
+                                        brand ("Claude Code"), not a label. */}
+                                    <div className="text-[11px] font-semibold text-ink-600 tracking-wider">
                                       {t('me.engineModelConfig', { engine: engineLabel(row.id) })}
                                     </div>
-                                    <div>
-                                      <label className="block text-[11px] text-ink-500 mb-1">{t('me.engineDefaultModel')}</label>
-                                      <input
-                                        type="text"
-                                        value={modelInput}
-                                        disabled={savingModel}
-                                        onChange={(e) => setModelInput(e.target.value)}
-                                        placeholder={t('me.engineModelPlaceholder')}
-                                        className="w-full px-2 py-1.5 text-[12px] rounded-[8px] font-mono"
-                                        style={{ border: '1px solid var(--ink-100)', background: 'var(--paper)' }}
-                                      />
-                                    </div>
-                                    <div>
-                                      <label className="block text-[11px] text-ink-500 mb-1">{t('me.engineFastModel')}</label>
-                                      <input
-                                        type="text"
-                                        value={fastModelInput}
-                                        disabled={savingModel}
-                                        onChange={(e) => setFastModelInput(e.target.value)}
-                                        placeholder={t('me.engineFastModelPlaceholder')}
-                                        className="w-full px-2 py-1.5 text-[12px] rounded-[8px] font-mono"
-                                        style={{ border: '1px solid var(--ink-100)', background: 'var(--paper)' }}
-                                      />
-                                    </div>
+                                    {/* <fieldset disabled> carries the in-flight
+                                        disable the plain inputs had: <Combobox>
+                                        exposes no `disabled` prop. */}
+                                    <fieldset disabled={savingModel} className="m-0 min-w-0 space-y-2 border-0 p-0">
+                                      <div>
+                                        <label className="block text-[11px] text-ink-500 mb-1">{t('me.engineDefaultModel')}</label>
+                                        <Combobox
+                                          ariaLabel={t('me.engineDefaultModel')}
+                                          value={modelInput}
+                                          onValueChange={setModelInput}
+                                          options={engineModelChoices(row.modelCatalog, 'big', {
+                                            follow: t('me.engineModelNotSet'),
+                                            recommended: t('agent.recommended'),
+                                            localDefault: (model) => t('agent.modelLocalDefault', { model }),
+                                          })}
+                                          searchPlaceholder={t('agent.searchModels')}
+                                          allowCustom={row.modelCatalog?.supportsCustom !== false}
+                                          customLabel={(value) => t('agent.useCustomModel', { model: value })}
+                                        />
+                                      </div>
+                                      {/* Engines that never run a separate fast model
+                                          hide the field rather than accept a value the
+                                          server would silently ignore. */}
+                                      {row.modelCatalog?.fastModelScope !== 'unsupported' && (
+                                        <div>
+                                          <label className="block text-[11px] text-ink-500 mb-1">{t('me.engineFastModel')}</label>
+                                          <Combobox
+                                            ariaLabel={t('me.engineFastModel')}
+                                            value={fastModelInput}
+                                            onValueChange={setFastModelInput}
+                                            options={engineModelChoices(row.modelCatalog, 'small', {
+                                              follow: t('me.engineModelNotSet'),
+                                              recommended: t('agent.recommended'),
+                                              localDefault: (model) => t('agent.modelLocalDefault', { model }),
+                                            })}
+                                            searchPlaceholder={t('agent.searchModels')}
+                                            allowCustom={row.modelCatalog?.supportsCustom !== false}
+                                            customLabel={(value) => t('agent.useCustomModel', { model: value })}
+                                          />
+                                        </div>
+                                      )}
+                                    </fieldset>
                                     <p className="text-[11px] text-ink-500">{t('me.engineModelHelp')}</p>
+                                    {catalogTrust(row.modelCatalog) === 'guessed' && (
+                                      <p className="text-[11px] text-ink-500">{t('agent.modelCatalogGuessed')}</p>
+                                    )}
+                                    {catalogTrust(row.modelCatalog) === 'unverified' && (
+                                      <p className="text-[11px] text-ink-500">{t('agent.modelCatalogUnverified')}</p>
+                                    )}
                                     <div className="flex gap-2">
                                       <button
                                         type="button"

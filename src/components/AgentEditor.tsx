@@ -10,9 +10,10 @@ import { TextArea } from '@/components/TextArea'
 import { Select } from '@/components/Select'
 import { Combobox, type ComboboxOption } from '@/components/Combobox'
 import { Checkbox } from '@/components/Checkbox'
-import { supportsNativeFastMode } from '../../shared/native-fast-mode'
 import type { Participant, EngineId } from '@/types'
 import { useT } from '@/lib/i18n'
+import { catalogTrust } from '@/lib/engine-model-choices'
+import { fastModeAvailable } from '@/lib/agent-fast-mode'
 import { engineLabel } from '@/lib/engines'
 
 const INHERIT_ENGINE = '__inherit__'
@@ -114,17 +115,37 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const engineDefaults = providerProfile ? undefined : selectedComputer?.engineDefaults?.[selectedEngineId]
   const engineDefaultModel = engineDefaults?.model ?? undefined
   const engineDefaultFastModel = engineDefaults?.fastModel ?? undefined
-  const effectiveModel = model.trim() || engineDefaultModel || modelCatalog?.defaultModel
+  // A `presets` catalog is the daemon's fallback, not a listing, and an
+  // `unverified` one came from a daemon that merged its presets into a real
+  // listing. Neither can name a model this account is known to run, so neither
+  // offers rows; the field says which happened instead.
+  const modelCatalogTrust = isByoa ? catalogTrust(modelCatalog) : 'missing'
   const showNativeFastMode = isByoa && (selectedEngineId === 'codex' || selectedEngineId === 'claude')
-  const nativeFastModeSupported = supportsNativeFastMode(selectedEngineId, effectiveModel)
-    && modelCatalog?.models.find((option) => option.id === effectiveModel)?.supportsFastMode !== false
+  // Fast Mode is not a suggestion, so it reads the whole catalog rather than
+  // the vouched-for rows above: dropping a known default or a
+  // `supportsFastMode: false` would flip an existing Agent's setting on its next
+  // save, which writes whatever this computes. See the module for both cases.
+  const nativeFastModeSupported = fastModeAvailable({
+    engine: selectedEngineId,
+    model,
+    engineDefault: engineDefaultModel,
+    catalog: modelCatalog,
+  })
+  // A configured computer default is authoritative, so it needs no label. The
+  // catalog's default is only this computer's CLI setting — a deployment pin can
+  // still win — so that one names its source instead of promising the model, and
+  // it is quoted only when the catalog itself can be vouched for.
+  const reportedDefault = (reported: string | null | undefined) =>
+    modelCatalogTrust === 'reported' && reported ? t('agent.modelLocalDefault', { model: reported }) : undefined
+  // The Cumora-side pin is applied by the server, so it is quoted even when the
+  // catalog is not: it is the value that actually runs.
   const modelOptions: Array<ComboboxOption<string>> = [
     {
       value: '',
       label: t('agent.followEngineDefault'),
-      hint: engineDefaultModel ?? modelCatalog?.defaultModel ?? undefined,
+      hint: engineDefaultModel ?? reportedDefault(modelCatalog?.defaultModel),
     },
-    ...(modelCatalog?.models ?? []).map((option) => ({
+    ...(modelCatalogTrust === 'reported' ? modelCatalog?.models ?? [] : []).map((option) => ({
       value: option.id,
       label: option.label,
       hint: [
@@ -137,9 +158,9 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     {
       value: '',
       label: t('agent.followSmallBrainDefault'),
-      hint: engineDefaultFastModel ?? modelCatalog?.defaultFastModel ?? undefined,
+      hint: engineDefaultFastModel ?? reportedDefault(modelCatalog?.defaultFastModel),
     },
-    ...(modelCatalog?.models ?? []).map((option) => ({
+    ...(modelCatalogTrust === 'reported' ? modelCatalog?.models ?? [] : []).map((option) => ({
       value: option.id,
       label: option.label,
       hint: [
@@ -148,6 +169,10 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       ].filter(Boolean).join(' · ') || undefined,
     })),
   ]
+  const catalogNotice = !isByoa ? ''
+    : modelCatalogTrust === 'guessed' ? t('agent.modelCatalogGuessed')
+      : modelCatalogTrust === 'unverified' ? t('agent.modelCatalogUnverified')
+        : ''
   const origin = getPairingServerOrigin()
   const repairCommand = repairCode
     ? `npx cumora@latest agent computer --pair ${repairCode}${origin ? ` --server ${origin}` : ''}`
@@ -405,7 +430,9 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
 
           <Field
             label={isByoa ? t('agent.modelLabelByoa') : t('agent.modelLabel')}
-            hint={isByoa ? t('agent.modelHintByoaCatalog') : t('agent.modelHintCloud')}
+            hint={isByoa
+              ? [t('agent.modelHintByoaCatalog'), catalogNotice].filter(Boolean).join(' ')
+              : t('agent.modelHintCloud')}
           >
             {isByoa ? (
               <Combobox
@@ -444,7 +471,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           {isByoa && (!modelCatalog || modelCatalog.fastModelScope === 'agent') && (
             <Field
               label={t('agent.fastLabelByoa')}
-              hint={t('agent.fastHintByoaCatalog')}
+              hint={[t('agent.fastHintByoaCatalog'), catalogNotice].filter(Boolean).join(' ')}
             >
               <Combobox
                 ariaLabel={t('agent.fastLabelByoa')}

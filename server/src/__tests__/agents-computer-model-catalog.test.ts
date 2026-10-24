@@ -105,6 +105,7 @@ test('Claude custom-provider settings expose only core bootstrap values and mode
     assert.equal(catalog.defaultFastModel, 'provider/haiku-small')
     assert.equal(catalog.prefersLocalDefault, true)
     assert.equal(catalog.source, 'cli')
+    assert.equal(catalog.trustedModels, true)
     assert.deepEqual(catalog.models.map((model) => model.id), [
       'provider/opus-large',
       'provider/haiku-small',
@@ -197,6 +198,58 @@ async function stubEngineCli(name: string, stdout: string): Promise<{ bin: strin
   return { bin, cleanup: () => rm(root, { recursive: true, force: true }) }
 }
 
+/** A codex stand-in that answers `model/list` with exactly `rows`. Cross-platform,
+ *  because the shell-script stub above only actually runs on POSIX. */
+async function stubCodexListing(rows: Array<Record<string, unknown>>): Promise<{ bin: string; cleanup: () => Promise<void> }> {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-codex-listing-'))
+  const script = join(root, 'catalog.cjs')
+  const bin = join(root, process.platform === 'win32' ? 'codex.cmd' : 'codex')
+  await writeFile(script, `
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line)
+  if (msg.id) process.stdout.write(JSON.stringify({ id: msg.id, result: msg.method === 'model/list' ? { data: ${JSON.stringify(rows)} } : {} }) + '\\n')
+})
+`)
+  await writeFile(bin, process.platform === 'win32'
+    ? `@echo off\r\n"${process.execPath}" "%~dp0catalog.cjs" %*\r\n`
+    : `#!/bin/sh\nexec node "${script}" "$@"\n`, { mode: 0o755 })
+  return { bin, cleanup: () => rm(root, { recursive: true, force: true }) }
+}
+
+test('a provider that lists one model offers only that model, not the preset tail', async () => {
+  // The review case: a gateway account returns a single model. The preset used
+  // to be appended behind the real listing, so the picker offered six
+  // antigravity ids the account cannot run — each marked "Recommended", each
+  // selectable as a computer default that every inheriting Agent would fail on.
+  const { bin, cleanup } = await stubCodexListing([{ model: 'gateway/only-model', displayName: 'Only Model', isDefault: true }])
+  try {
+    clearModelCatalogCache()
+    const catalog = await discoverEngineModelCatalog('codex', bin, true)
+    assert.equal(catalog.source, 'protocol')
+    assert.equal(catalog.trustedModels, true, 'a listing this build produced is vouched for')
+    assert.deepEqual(catalog.models.map((model) => model.id), ['gateway/only-model'])
+    // The preset's fast default is `gpt-5.4-mini`, which this account never
+    // listed, so the hint must not promise it either.
+    assert.equal(catalog.defaultFastModel, null)
+  } finally {
+    clearModelCatalogCache()
+    await cleanup()
+  }
+})
+
+test('a listing keeps the preset fast default only when the account listed it', async () => {
+  const { bin, cleanup } = await stubCodexListing([{ model: 'gpt-5.4-mini' }, { model: 'gpt-5.6-sol', isDefault: true }])
+  try {
+    clearModelCatalogCache()
+    const catalog = await discoverEngineModelCatalog('codex', bin, true)
+    assert.deepEqual(catalog.models.map((model) => model.id), ['gpt-5.4-mini', 'gpt-5.6-sol'])
+    assert.equal(catalog.defaultFastModel, 'gpt-5.4-mini')
+  } finally {
+    clearModelCatalogCache()
+    await cleanup()
+  }
+})
+
 test('a CLI that listed nothing offers nothing, not a model named after its excuse', async () => {
   // End to end through the real dispatch. Cursor has no preset — cumora takes
   // its whole catalog from the CLI — so before the fix the picker's only entry
@@ -224,6 +277,8 @@ test('an engine with a preset keeps it when its CLI fails to list', async () => 
     assert.equal(catalog.source, 'presets')
     assert.equal(catalog.models[0]?.id, 'gemini-3.8-flash-high')
     assert.equal(catalog.models.some((model) => /^Error/.test(model.id)), false)
+    // A fallback is not a listing: without this flag the app withholds the rows.
+    assert.equal(catalog.trustedModels, undefined)
   } finally {
     clearModelCatalogCache()
     await cleanup()

@@ -214,6 +214,9 @@ function sanitizeModelCatalog(raw: unknown): EngineModelCatalog | undefined {
     supportsCustom: rec.supportsCustom !== false,
     fastModelScope,
     source,
+    // Passed through, never defaulted: only a daemon that knows its list is
+    // preset-free may say so, and the app withholds model rows without it.
+    ...(rec.trustedModels === true ? { trustedModels: true } : {}),
   }
 }
 

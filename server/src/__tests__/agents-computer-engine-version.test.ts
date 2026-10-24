@@ -422,7 +422,7 @@ test('sanitizeDetectedEngines bounds and cleans account-specific model catalogs'
   const [row] = sanitizeDetectedEngines([{
     id: 'codex', bin: 'codex', path: '/usr/local/bin/codex',
     modelCatalog: {
-      source: 'protocol', supportsCustom: true, fastModelScope: 'agent',
+      source: 'protocol', supportsCustom: true, fastModelScope: 'agent', trustedModels: true,
       defaultModel: 'gpt-5.6-sol', defaultFastModel: 'gpt-5.4-mini',
       models: [
         { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol\nspoof', recommendedFor: ['big', 'bogus'] },
@@ -432,10 +432,26 @@ test('sanitizeDetectedEngines bounds and cleans account-specific model catalogs'
     },
   }], ['codex'])
   assert.deepEqual(row?.modelCatalog, {
-    source: 'protocol', supportsCustom: true, fastModelScope: 'agent',
+    source: 'protocol', supportsCustom: true, fastModelScope: 'agent', trustedModels: true,
     defaultModel: 'gpt-5.6-sol', defaultFastModel: 'gpt-5.4-mini',
     models: [{
       id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol spoof', description: null, recommendedFor: ['big'],
     }],
   })
+})
+
+test('a catalog that does not vouch for its models keeps no flag, so the app withholds rows', () => {
+  // Daemons that predate `trustedModels` merged their presets into the reported
+  // listing. Passing an absent flag through as `true` (or defaulting it) would
+  // hand the app exactly the unvouched-for list it must not offer.
+  const [row] = sanitizeDetectedEngines([{
+    id: 'codex', bin: 'codex', path: '/usr/local/bin/codex',
+    modelCatalog: {
+      source: 'protocol', supportsCustom: true, fastModelScope: 'agent',
+      defaultModel: null, defaultFastModel: null,
+      models: [{ id: 'gateway/only-model', label: 'Only Model' }],
+    },
+  }], ['codex'])
+  assert.equal(row?.modelCatalog?.trustedModels, undefined)
+  assert.equal('trustedModels' in (row?.modelCatalog ?? {}), false)
 })

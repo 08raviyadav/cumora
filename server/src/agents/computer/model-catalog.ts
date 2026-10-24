@@ -28,6 +28,12 @@ export interface EngineModelCatalog {
   supportsCustom: boolean
   fastModelScope: FastModelScope
   source: ModelCatalogSource
+  /** Every id in `models` is runnable by this computer's account: the provider
+   *  listed it, or the engine's own aliases are first-party by definition.
+   *  Absent means "this build cannot promise that" — builds before this flag
+   *  merged their presets into the reported list, and the app must not present
+   *  such a catalog as the provider's. */
+  trustedModels?: boolean
 }
 
 const PRESETS: Record<EngineId, EngineModelCatalog> = {
@@ -186,13 +192,25 @@ function mergeModels(discovered: EngineModelOption[], fallback: EngineModelOptio
   return out
 }
 
-function withPreset(id: EngineId, discovered: EngineModelOption[], source: 'protocol' | 'cli', defaultModel: string | null): EngineModelCatalog {
+/** A CLI that listed models answered the question the preset was guessing at, so
+ *  the preset's models must not ride along. They used to be appended behind the
+ *  real listing, which meant a provider that returned one model still produced a
+ *  picker offering a dozen — each wearing the preset's "Recommended" marker, each
+ *  one an Agent could inherit and then fail on, because the account cannot run
+ *  it. The preset still supplies what it alone knows: fast-model scope and
+ *  whether custom entry is allowed. */
+function fromDiscovered(id: EngineId, discovered: EngineModelOption[], source: 'protocol' | 'cli', defaultModel: string | null): EngineModelCatalog {
   const preset = clonePreset(id)
   return {
     ...preset,
-    models: mergeModels(discovered, preset.models),
+    models: mergeModels(discovered, []),
     defaultModel: clean(defaultModel, 160),
+    // The fast default is a hint about what an unpinned Agent will run, so a
+    // preset id the account did not list is the same lie as an unlisted model.
+    defaultFastModel: discovered.some((model) => model.id === preset.defaultFastModel) ? preset.defaultFastModel : null,
     source,
+    // The provider answered, so every id above is one this account can reach.
+    trustedModels: true,
   }
 }
 
@@ -407,8 +425,10 @@ function discoverCodex(command: string, env: NodeJS.ProcessEnv): Promise<{ model
 }
 
 /** Discover the account/config-specific catalog without making a model call.
- * Failure is deliberately soft: a compact preset catalog plus custom entry is
- * still more useful than hiding the selector or blocking an engine rescan. */
+ * Failure is deliberately soft: the preset still names the engine's own
+ * defaults and the app keeps custom entry open, which beats blocking an engine
+ * rescan. The preset is not a listing though, so it never carries
+ * `trustedModels` and the app shows no rows for it. */
 export async function discoverEngineModelCatalog(
   id: EngineId,
   binPath: string | null,
@@ -442,23 +462,26 @@ export async function discoverEngineModelCatalog(
         defaultFastModel: defaultFastModel ?? (prefersLocalDefault ? null : preset.defaultFastModel),
         prefersLocalDefault,
         source: 'cli',
+        // First-party aliases are runnable by any Anthropic account; on a custom
+        // endpoint they were not merged at all.
+        trustedModels: true,
       }
     }
   } else if (id === 'codex') {
     const result = await discoverCodex(binPath, env)
-    if (result?.models.length) catalog = withPreset(id, result.models, 'protocol', result.defaultModel)
+    if (result?.models.length) catalog = fromDiscovered(id, result.models, 'protocol', result.defaultModel)
   } else if (id === 'cursor') {
     const models = parseListedModels(await runText(binPath, ['models']), 'cursor')
-    if (models.length) catalog = withPreset(id, models, 'cli', null)
+    if (models.length) catalog = fromDiscovered(id, models, 'cli', null)
   } else if (id === 'opencode') {
     const models = parseListedModels(await runText(binPath, ['models']), 'provider')
-    if (models.length) catalog = withPreset(id, models, 'cli', null)
+    if (models.length) catalog = fromDiscovered(id, models, 'cli', null)
   } else if (id === 'pi') {
     const models = parseListedModels(await runText(binPath, ['--list-models']), 'pi')
-    if (models.length) catalog = withPreset(id, models, 'cli', null)
+    if (models.length) catalog = fromDiscovered(id, models, 'cli', null)
   } else if (id === 'antigravity') {
     const models = parseListedModels(await runText(binPath, ['models']), 'antigravity')
-    if (models.length) catalog = withPreset(id, models, 'cli', null)
+    if (models.length) catalog = fromDiscovered(id, models, 'cli', null)
   }
 
   if (catalog) catalogCache.set(cacheKey, { at: Date.now(), catalog })
