@@ -13,6 +13,7 @@
 
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import path from 'node:path'
 
 interface CommandInvocation {
   command: string
@@ -256,6 +257,140 @@ function realpathOf(binPath: string): string {
   }
 }
 
+/** npm's Windows shims are a few hundred bytes; anything larger is not one, and
+ *  reading a real binary looking for a package name would be pointless work. */
+const SHIM_READ_LIMIT = 64 * 1024
+
+/** The package directory `file` sits inside, when that directory is in a
+ *  node_modules tree — `…/node_modules/@openai/codex/bin/codex.js` is in
+ *  @openai/codex. */
+function owningPackageDir(file: string): string | null {
+  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
+    const parent = path.dirname(dir)
+    if (parent === dir) return null
+    const above = path.basename(parent)
+    // `<pkg>` directly under node_modules, or `<@scope>/<pkg>` under it.
+    if (above === 'node_modules') return dir
+    if (above.startsWith('@') && path.basename(path.dirname(parent)) === 'node_modules') return dir
+  }
+}
+
+/** The version the package containing `file` records, or null when `file` is in
+ *  none — the read half of `npmPackageVersion`, shared by both shapes. */
+function versionOfOwner(file: string): string | null {
+  const owner = owningPackageDir(realpathOf(file))
+  return owner ? versionFromPackageJson(owner) : null
+}
+
+/** The path a shim names at `at`, the position of its `/node_modules/`: the text
+ *  before that is the directory the line starts from — the shim's own (`%dp0%`,
+ *  `%~dp0`, `$basedir`) or a real path — and the text after it runs to the end of
+ *  the quoted path. pnpm keeps a store directory in between
+ *  (`…/global/5/node_modules`), so the prefix is resolved, not assumed to sit
+ *  beside the shim. Null when a variable is left unexpanded: a name nothing can
+ *  be read from. */
+function shimPathAt(flat: string, at: number, shimDir: string): string | null {
+  // pnpm quotes every path it writes, and a global directory may hold a space
+  // (`…/global packages/5/…`), so a quoted span — not whitespace — is the
+  // boundary when there is one. Quotes never span a line in a shim.
+  const from = flat.lastIndexOf('\n', at) + 1
+  let to = flat.indexOf('\n', at)
+  if (to < 0) to = flat.length
+  let span: [number, number] | null = null
+  let open = -1
+  let quote = ''
+  for (let i = from; i < to && !span; i++) {
+    const ch = flat.charAt(i)
+    if (!quote) {
+      if (ch === '"' || ch === "'") {
+        quote = ch
+        open = i
+      }
+    } else if (ch === quote) {
+      if (at > open && at < i) span = [open + 1, i]
+      quote = ''
+    }
+  }
+  if (!span && quote && at > open) span = [open + 1, to]
+  if (!span) {
+    let start = at
+    while (start > from && !/[\s(=;,`]/.test(flat.charAt(start - 1))) start--
+    let stop = at
+    while (stop < to && !/[\s);,`]/.test(flat.charAt(stop))) stop++
+    span = [start, stop]
+  }
+  let token = flat.slice(span[0], span[1])
+  const self = /^(?:%~dp0|%dp0%|\$basedir|\$\{basedir\})\/?/i.exec(token)
+  if (self) token = token.slice(self[0].length).replace(/^\/+/, '')
+  if (/[%$]/.test(token)) return null
+  return path.resolve(shimDir, token)
+}
+
+function versionFromPackageJson(pkgDir: string): string | null {
+  try {
+    const raw = fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8')
+    const version = (JSON.parse(raw) as { version?: unknown }).version
+    return typeof version === 'string' ? parseCliVersion(version) : null
+  } catch {
+    return null
+  }
+}
+
+/** The version recorded by the npm package that owns `binPath`, or null when it
+ *  belongs to none — read, never run.
+ *
+ *  Two shapes, because npm puts a shim *beside* node_modules rather than a link
+ *  into it: a path already inside the package tree is answered by walking up to
+ *  its package.json, while `C:\…\opencode` (the shim) only names the package in
+ *  its text (`%dp0%\node_modules\opencode-ai\bin\opencode.exe`). Magpie splits
+ *  these the same way, as npmVersion and shimVersion. pnpm's shim is the second
+ *  shape with the store in the middle — `%~dp0\..\global\5\node_modules\…` — so
+ *  the path is resolved from the shim's directory instead of assumed beside it.
+ *
+ *  This exists because an installed CLI can fail to answer: opencode-ai ships a
+ *  placeholder `bin/opencode.exe` until its postinstall runs, and that
+ *  placeholder exits with an error instead of a version — so the Computers tab
+ *  read "版本未知" for a CLI whose package plainly said 1.19.4. */
+export function npmPackageVersion(binPath: string | null): string | null {
+  if (!binPath) return null
+  const real = realpathOf(binPath)
+  const owned = versionOfOwner(real)
+  if (owned) return owned
+
+  let text: string
+  try {
+    const stat = fs.statSync(real)
+    if (!stat.isFile() || stat.size > SHIM_READ_LIMIT) return null
+    text = fs.readFileSync(real, 'utf8')
+  } catch {
+    return null
+  }
+  // Shims spell the path with the separator of the platform they came from, and
+  // a pnpm shim mentions several; take the first that names an installed package.
+  const flat = text.replace(/\\/g, '/')
+  for (let at = flat.indexOf('/node_modules/'); at >= 0; at = flat.indexOf('/node_modules/', at + 1)) {
+    const target = shimPathAt(flat, at, path.dirname(real))
+    const version = target ? versionOfOwner(target) : null
+    if (version) return version
+  }
+  return null
+}
+
+/** What this machine has installed for one engine: what the CLI prints, else
+ *  what its npm package records.
+ *
+ *  Asked in that order deliberately, unlike magpie (which reads the package
+ *  first and so never runs an npm CLI): `claude update` and `codex update`
+ *  replace the binary in place, so the printed version describes what will
+ *  actually run while package.json can lag behind it. The package is only the
+ *  fallback for a CLI that cannot answer at all — which is the whole bug. */
+async function installedVersion(id: string, binPath: string): Promise<string | null> {
+  const spec = ENGINE_VERSION_SPECS[id]
+  if (!spec) return null
+  const printed = versionFromOutput(await spawnCommand(binPath, spec.versionArgs, 6000))
+  return printed ?? npmPackageVersion(binPath)
+}
+
 export function isHomebrewInstall(real: string, formula: string): boolean {
   // npm under Homebrew's Node belongs to npm, not the Node formula's keg.
   return real.match(/(?:^|[/\\])(?:Cellar|Caskroom)[/\\]([^/\\]+)[/\\]/i)?.[1] === formula
@@ -403,7 +538,7 @@ export async function probeEngineVersion(id: string, binPath: string | null): Pr
   const empty: EngineVersionInfo = { version: null, latest: null, outdated: false, updateCommand: null }
   if (!spec || !binPath) return empty
 
-  const version = versionFromOutput(await spawnCommand(binPath, spec.versionArgs, 6000))
+  const version = await installedVersion(id, binPath)
   const latest = await probeLatest(id, spec, binPath)
   const outdated = isCliOutdated(version, latest)
   return {
@@ -415,7 +550,11 @@ export async function probeEngineVersion(id: string, binPath: string | null): Pr
 }
 
 /** Local-only version probe for security capability gates. Unlike
- * probeEngineVersion(), this never contacts npm or an engine updater. */
+ * probeEngineVersion(), this never contacts npm or an engine updater — and,
+ * unlike it, never falls back to package.json either: this answer decides
+ * whether a binary may run under the sandbox, so a CLI that cannot say what it
+ * is stays unverified rather than borrowing the version of the package it was
+ * installed from. */
 export async function probeLocalEngineVersion(id: string, binPath: string | null): Promise<string | null> {
   const spec = ENGINE_VERSION_SPECS[id]
   if (!spec || !binPath) return null

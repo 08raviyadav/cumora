@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -21,7 +21,7 @@ process.env.OPENAI_API_KEY ??= 'test-key'
 const {
   parseCliVersion, isCliOutdated, isCliVersionAtLeast, inferUpdateCommand, updateArgv,
   parseCursorAbout, parseGrokCheck, ENGINE_VERSION_SPECS, versionCommandInvocation,
-  probeLocalEngineVersionWithRetry, runEngineUpdate,
+  probeLocalEngineVersionWithRetry, runEngineUpdate, npmPackageVersion, probeEngineVersion,
 } = await import('../agents/computer/cli-version.js')
 const { sanitizeDetectedEngines } = await import('../agents/computer/registry.js')
 
@@ -71,6 +71,189 @@ test('an inconclusive local version probe retries and stops on the first concret
 
     assert.equal(await probeLocalEngineVersionWithRetry('claude', cli, [0, 1, 1]), '2.1.248')
     assert.equal(await readFile(counter, 'utf8'), '3')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('npmPackageVersion reads the package that owns a binary inside node_modules', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-npm-version-'))
+  try {
+    const pkgDir = join(root, 'lib', 'node_modules', '@openai', 'codex')
+    await mkdir(join(pkgDir, 'bin'), { recursive: true })
+    await writeFile(join(pkgDir, 'package.json'), JSON.stringify({ name: '@openai/codex', version: '0.164.0' }))
+    const bin = join(pkgDir, 'bin', 'codex.js')
+    await writeFile(bin, '#!/usr/bin/env node\n')
+    assert.equal(npmPackageVersion(bin), '0.164.0')
+    // npm links a global install through a symlink; the real path decides.
+    // Windows refuses symlinks without developer mode, which is fine — the
+    // path shape above already covers the walk-up.
+    const link = join(root, 'codex')
+    try {
+      await symlink(bin, link)
+      assert.equal(npmPackageVersion(link), '0.164.0')
+    } catch { /* symlinks unavailable on this host */ }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('npmPackageVersion reads the package an npm Windows shim points at', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-npm-shim-'))
+  try {
+    const pkgDir = join(root, 'node_modules', 'opencode-ai')
+    await mkdir(pkgDir, { recursive: true })
+    await writeFile(join(pkgDir, 'package.json'), JSON.stringify({ name: 'opencode-ai', version: '1.19.4' }))
+    // The shape npm writes: a shim *beside* node_modules, naming its own path.
+    const shim = join(root, 'opencode')
+    await writeFile(shim, [
+      '@ECHO off',
+      'SETLOCAL',
+      'SET "dp0=%~dp0"',
+      'IF EXIST "%dp0%\\node_modules\\opencode-ai\\bin\\opencode.exe" (',
+      '  "%dp0%\\node_modules\\opencode-ai\\bin\\opencode.exe" %*',
+      ')',
+    ].join('\r\n'))
+    assert.equal(npmPackageVersion(shim), '1.19.4')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('npmPackageVersion follows the symlink a POSIX npm global install uses', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-npm-posix-'))
+  try {
+    // What `npm i -g opencode-ai` leaves on macOS and Linux: <prefix>/bin/<bin>
+    // is a symlink into <prefix>/lib/node_modules, never a file of its own.
+    const prefix = join(root, 'usr', 'local')
+    const pkgDir = join(prefix, 'lib', 'node_modules', 'opencode-ai')
+    await mkdir(join(pkgDir, 'bin'), { recursive: true })
+    await writeFile(join(pkgDir, 'package.json'), JSON.stringify({ name: 'opencode-ai', version: '1.19.4' }))
+    const target = join(pkgDir, 'bin', 'opencode.exe')
+    await writeFile(target, '#!/bin/sh\necho "postinstall was not run" >&2\nexit 1\n')
+    await mkdir(join(prefix, 'bin'), { recursive: true })
+    const link = join(prefix, 'bin', 'opencode')
+    try {
+      await symlink(join('..', 'lib', 'node_modules', 'opencode-ai', 'bin', 'opencode.exe'), link)
+    } catch {
+      return // symlinks unavailable on this host; the shape is covered above
+    }
+    assert.equal(npmPackageVersion(link), '1.19.4')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a CLI that cannot report a version is answered by its package instead', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-broken-cli-'))
+  try {
+    const pkgDir = join(root, 'node_modules', 'opencode-ai')
+    await mkdir(join(pkgDir, 'bin'), { recursive: true })
+    await writeFile(join(pkgDir, 'package.json'), JSON.stringify({ name: 'opencode-ai', version: '1.19.4' }))
+    // Exactly what opencode-ai ships before its postinstall: exits 1 and says
+    // nothing about a version. This is the bug, reproduced.
+    const bin = join(pkgDir, 'bin', 'opencode')
+    await writeFile(bin, '#!/bin/sh\necho "Error: postinstall was not run." >&2\nexit 1\n')
+    await chmod(bin, 0o755)
+    if (process.platform === 'win32') {
+      await writeFile(`${bin}.cmd`, '@echo off\r\necho Error: postinstall was not run. 1>&2\r\nexit /b 1\r\n')
+    }
+
+    // No registry in a unit test: probeLatest() must fail quietly, not hang.
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response('{}', { status: 404 })) as typeof fetch
+    try {
+      const info = await probeEngineVersion('opencode', bin)
+      assert.equal(info.version, '1.19.4', 'the package says what the CLI cannot')
+      assert.equal(info.latest, null)
+      assert.equal(info.outdated, false, 'no upstream means no nagging')
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('npmPackageVersion reads the package a pnpm global shim points at', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-pnpm-shim-'))
+  try {
+    // What `pnpm add -g` leaves (9.15.0, verified against a real install): the
+    // shim sits in the global bin dir, but the package lives in the store one
+    // level over — <global-dir>/<major>/node_modules/<pkg>, not beside the shim.
+    const binDir = join(root, 'pnpm')
+    const pkgDir = join(root, 'pnpm-global', '5', 'node_modules', 'opencode-ai')
+    await mkdir(join(pkgDir, 'bin'), { recursive: true })
+    await writeFile(join(pkgDir, 'package.json'), JSON.stringify({ name: 'opencode-ai', version: '1.19.4' }))
+    await mkdir(binDir, { recursive: true })
+    // Verbatim shape, minus the absolute NODE_PATH lines: %~dp0\.. is the store.
+    const cmd = join(binDir, 'opencode.CMD')
+    await writeFile(cmd, [
+      '@SETLOCAL',
+      `@IF EXIST "%~dp0\\..\\pnpm-global\\5\\node_modules\\opencode-ai\\bin\\opencode.exe" (`,
+      '  "%~dp0\\..\\pnpm-global\\5\\node_modules\\opencode-ai\\bin\\opencode.exe" %*',
+      ')',
+    ].join('\r\n'))
+    assert.equal(npmPackageVersion(cmd), '1.19.4')
+    // The POSIX twin names the same store through $basedir.
+    const sh = join(binDir, 'opencode')
+    await writeFile(sh, [
+      '#!/bin/sh',
+      'basedir=$(dirname "$(echo "$0" | sed -e \'s,\\\\,/,g\')")',
+      'exec "$basedir/../pnpm-global/5/node_modules/opencode-ai/bin/opencode.exe" "$@"',
+    ].join('\n'))
+    assert.equal(npmPackageVersion(sh), '1.19.4')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('npmPackageVersion reads a pnpm shim whose global directory holds a space', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-pnpm-space-'))
+  try {
+    // `pnpm add -g --global-dir "…/global packages"` (9.15.0, real install).
+    // Every path stays quoted; splitting on whitespace truncates it.
+    const binDir = join(root, 'pnpm')
+    const pkgDir = join(root, 'global packages', '5', 'node_modules', 'opencode-ai')
+    await mkdir(join(pkgDir, 'bin'), { recursive: true })
+    await writeFile(join(pkgDir, 'package.json'), JSON.stringify({ name: 'opencode-ai', version: '1.19.4' }))
+    await mkdir(binDir, { recursive: true })
+    const cmd = join(binDir, 'opencode.CMD')
+    await writeFile(cmd, [
+      '@SETLOCAL',
+      '  "%~dp0\\/bin/sh.exe"  "%~dp0\\..\\global packages\\5\\node_modules\\opencode-ai\\bin\\opencode.exe" %*',
+    ].join('\r\n'))
+    assert.equal(npmPackageVersion(cmd), '1.19.4')
+    const sh = join(binDir, 'opencode')
+    await writeFile(sh, [
+      '#!/bin/sh',
+      'basedir=$(dirname "$(echo "$0" | sed -e \'s,\\\\,/,g\')")',
+      '  exec "$basedir//bin/sh"  "$basedir/../global packages/5/node_modules/opencode-ai/bin/opencode.exe" "$@"',
+    ].join('\n'))
+    assert.equal(npmPackageVersion(sh), '1.19.4')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('npmPackageVersion stays null for anything it cannot attribute', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-npm-none-'))
+  try {
+    // A real binary outside any package: never guess.
+    const standalone = join(root, 'opencode.exe')
+    await writeFile(standalone, Buffer.from([0x4d, 0x5a, 0x90, 0x00]))
+    assert.equal(npmPackageVersion(standalone), null)
+    // A shim whose package is not installed beside it.
+    const shim = join(root, 'codex')
+    await writeFile(shim, 'IF EXIST "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" (\r\n)\r\n')
+    assert.equal(npmPackageVersion(shim), null)
+    // A package.json without a version is not a version.
+    const pkgDir = join(root, 'node_modules', 'broken')
+    await mkdir(pkgDir, { recursive: true })
+    await writeFile(join(pkgDir, 'package.json'), '{"name":"broken"}')
+    assert.equal(npmPackageVersion(join(pkgDir, 'index.js')), null)
+    assert.equal(npmPackageVersion(null), null)
+    assert.equal(npmPackageVersion(join(root, 'missing')), null)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
