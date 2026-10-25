@@ -15,7 +15,7 @@
  *     runtime/jwt.ts — the same token a pod gets)
  */
 import { type ProviderProfileMetadata, isProviderProfileId, sanitizeProviderProfiles } from './provider-profiles.js'
-import { InvalidModelIdError, parseModelId } from './model-id.js'
+import { InvalidModelIdError, modelIdOrNull, parseModelId } from './model-id.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { pool } from '../../db/pool.js'
 import { audit } from '../../auth.js'
@@ -188,10 +188,10 @@ function sanitizeModelCatalog(raw: unknown): EngineModelCatalog | undefined {
   const models: EngineModelOption[] = []
   const seen = new Set<string>()
   if (Array.isArray(rec.models)) {
-    for (const rawModel of rec.models.slice(0, 128)) {
+    for (const rawModel of rec.models.slice(0, 1024)) {
       if (!rawModel || typeof rawModel !== 'object') continue
       const model = rawModel as Record<string, unknown>
-      const id = displayString(model.id, 160)
+      const id = typeof model.id === 'string' ? modelIdOrNull(model.id) : null
       if (!id || seen.has(id)) continue
       seen.add(id)
       const recommendedFor = Array.isArray(model.recommendedFor)
@@ -217,6 +217,7 @@ function sanitizeModelCatalog(raw: unknown): EngineModelCatalog | undefined {
     // Passed through, never defaulted: only a daemon that knows its list is
     // preset-free may say so, and the app withholds model rows without it.
     ...(rec.trustedModels === true ? { trustedModels: true } : {}),
+    ...(rec.stale === true ? { stale: true } : {}),
   }
 }
 
@@ -804,15 +805,13 @@ export async function listAgentsForComputer(computerId: string, supportsProvider
       ? engineDefaults as EngineDefaultsMap
       : {}) as EngineDefaultsMap
     const engineDefaultsForAgent = agent.engine ? defaults[agent.engine] : undefined
-    // A custom Claude endpoint owns its model namespace. Its reported defaults
-    // fill only unpinned fields; explicit per-Agent choices still win. When it
-    // cannot name a main/fast default, leave that field null so the CLI chooses
-    // instead of crossing an Anthropic deployment pin into the provider.
-    if (r.engine === 'claude' && localCatalog?.prefersLocalDefault) {
+    // Resolve unpinned defaults locally each turn so a provider change cannot
+    // turn an old catalog default into a permanent Agent pin.
+    if (localCatalog?.prefersLocalDefault) {
       return {
         ...agent,
-        model: agent.model ?? engineDefaultsForAgent?.model ?? localCatalog.defaultModel,
-        fastModel: agent.fastModel ?? engineDefaultsForAgent?.fastModel ?? localCatalog.defaultFastModel,
+        model: agent.model ?? engineDefaultsForAgent?.model ?? null,
+        fastModel: agent.fastModel ?? engineDefaultsForAgent?.fastModel ?? null,
       }
     }
     // Apply engine_defaults before deploy-level defaults

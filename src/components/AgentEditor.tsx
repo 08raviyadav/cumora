@@ -105,7 +105,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const selectedProfile = profiles.find((p) => p.id === providerProfile)
   const modelCatalog = providerProfile ? {
     models: [], defaultModel: selectedProfile?.model, defaultFastModel: selectedProfile?.fastModel,
-    supportsCustom: true, fastModelScope: 'agent',
+    supportsCustom: true, fastModelScope: 'agent', stale: false,
   } : detectedEngine?.modelCatalog
   // Per-computer engine model defaults (configured on the Computer card).
   // When the local CLI catalog can't name a default (e.g. custom endpoints),
@@ -170,7 +170,8 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     })),
   ]
   const catalogNotice = !isByoa ? ''
-    : modelCatalogTrust === 'guessed' ? t('agent.modelCatalogGuessed')
+    : modelCatalog?.stale ? t('agent.modelCatalogStale')
+      : modelCatalogTrust === 'guessed' ? t('agent.modelCatalogGuessed')
       : modelCatalogTrust === 'unverified' ? t('agent.modelCatalogUnverified')
         : ''
   const origin = getPairingServerOrigin()

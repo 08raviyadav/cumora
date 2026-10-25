@@ -1319,6 +1319,9 @@ function ComputersTab() {
                                       )}
                                     </fieldset>
                                     <p className="text-[11px] text-ink-500">{t('me.engineModelHelp')}</p>
+                                    {row.modelCatalog?.stale && (
+                                      <p className="text-[11px] text-ink-500">{t('agent.modelCatalogStale')}</p>
+                                    )}
                                     {catalogTrust(row.modelCatalog) === 'guessed' && (
                                       <p className="text-[11px] text-ink-500">{t('agent.modelCatalogGuessed')}</p>
                                     )}

@@ -1,8 +1,15 @@
 import { spawn } from 'node:child_process'
-import type { EngineId } from './engine.js'
+import { createHash } from 'node:crypto'
+import { homedir } from 'node:os'
 import { isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { versionCommandInvocation } from './cli-version.js'
-import { CODEX_RUNTIME_CONFIG_ARGS, codexRuntimeEnv } from './codex-runtime.js'
+import { codexProviderFingerprint, codexProviderRuntime } from './codex-provider.js'
+import { readCodexRpc } from './codex-rpc.js'
+import { CODEX_RUNTIME_CONFIG_ARGS, codexAuthFingerprint } from './codex-runtime.js'
+import { configuredEngineModels } from './configured-models.js'
+import type { EngineId } from './engine.js'
+import { modelIdOrNull } from './model-id.js'
+import { fetchProviderModels, MAX_CATALOG_MODELS, readProviderCatalogFile } from './provider-models.js'
 
 export type ModelCatalogSource = 'protocol' | 'cli' | 'presets'
 export type FastModelScope = 'agent' | 'computer' | 'unsupported'
@@ -28,12 +35,11 @@ export interface EngineModelCatalog {
   supportsCustom: boolean
   fastModelScope: FastModelScope
   source: ModelCatalogSource
-  /** Every id in `models` is runnable by this computer's account: the provider
-   *  listed it, or the engine's own aliases are first-party by definition.
-   *  Absent means "this build cannot promise that" — builds before this flag
-   *  merged their presets into the reported list, and the app must not present
-   *  such a catalog as the provider's. */
+  /** Choices explicitly configured or listed for this connection, without preset
+   * contamination. This does not guarantee execution or model capabilities.
+   * Absent on older daemons that appended unverified vendor presets. */
   trustedModels?: boolean
+  stale?: boolean
 }
 
 const PRESETS: Record<EngineId, EngineModelCatalog> = {
@@ -156,7 +162,10 @@ const PRESETS: Record<EngineId, EngineModelCatalog> = {
 const MODEL_PROBE_TIMEOUT_MS = 10_000
 const MODEL_OUTPUT_LIMIT = 2 * 1024 * 1024
 const MODEL_CACHE_TTL_MS = 15 * 60 * 1000
-const catalogCache = new Map<string, { at: number; catalog: EngineModelCatalog }>()
+const catalogCache = new Map<string, {
+  at: number; fingerprint: string; catalog: EngineModelCatalog
+  remote?: EngineModelOption[]; protocol?: EngineModelOption[]
+}>()
 
 export function clearModelCatalogCache(): void {
   catalogCache.clear()
@@ -177,7 +186,7 @@ function mergeModels(discovered: EngineModelOption[], fallback: EngineModelOptio
   const out: EngineModelOption[] = []
   const seen = new Set<string>()
   for (const model of [...discovered, ...fallback]) {
-    const id = clean(model.id, 160)
+    const id = modelIdOrNull(model.id)
     if (!id || seen.has(id)) continue
     seen.add(id)
     out.push({
@@ -187,7 +196,7 @@ function mergeModels(discovered: EngineModelOption[], fallback: EngineModelOptio
       recommendedFor: model.recommendedFor?.filter((tier): tier is 'big' | 'small' => tier === 'big' || tier === 'small'),
       ...(typeof model.supportsFastMode === 'boolean' ? { supportsFastMode: model.supportsFastMode } : {}),
     })
-    if (out.length >= 128) break
+    if (out.length >= MAX_CATALOG_MODELS) break
   }
   return out
 }
@@ -209,7 +218,6 @@ function fromDiscovered(id: EngineId, discovered: EngineModelOption[], source: '
     // preset id the account did not list is the same lie as an unlisted model.
     defaultFastModel: discovered.some((model) => model.id === preset.defaultFastModel) ? preset.defaultFastModel : null,
     source,
-    // The provider answered, so every id above is one this account can reach.
     trustedModels: true,
   }
 }
@@ -223,7 +231,7 @@ function stopChild(child: ReturnType<typeof spawn>): void {
   child.once('close', () => clearTimeout(timer))
 }
 
-function runText(command: string, args: string[]): Promise<string> {
+function runText(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<string | null> {
   return new Promise((resolve) => {
     const invocation = versionCommandInvocation(command, args)
     let child: ReturnType<typeof spawn>
@@ -231,29 +239,32 @@ function runText(command: string, args: string[]): Promise<string> {
       child = spawn(invocation.command, invocation.args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
+        env, cwd: homedir(),
         windowsVerbatimArguments: invocation.windowsVerbatimArguments === true,
       })
     } catch {
-      resolve('')
+      resolve(null)
       return
     }
     let output = ''
+    let exceeded = false
     const append = (chunk: Buffer) => {
+      if (Buffer.byteLength(output) + chunk.length > MODEL_OUTPUT_LIMIT) exceeded = true
       if (output.length < MODEL_OUTPUT_LIMIT) output += chunk.toString('utf8').slice(0, MODEL_OUTPUT_LIMIT - output.length)
     }
     child.stdout?.on('data', append)
-    child.stderr?.on('data', append)
+    child.stderr?.resume()
     let settled = false
-    const finish = () => {
+    const finish = (ok = false) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      resolve(output.trim())
+      resolve(ok && !exceeded ? output.trim() : null)
     }
     const timer = setTimeout(() => { stopChild(child); finish() }, MODEL_PROBE_TIMEOUT_MS)
     timer.unref?.()
-    child.once('error', finish)
-    child.once('close', finish)
+    child.once('error', () => finish())
+    child.once('close', code => finish(code === 0))
   })
 }
 
@@ -268,27 +279,14 @@ function splitIdColumn(line: string): [string, string] {
   return [stripped.slice(0, sep).trim(), stripped.slice(sep).trim()]
 }
 
-/** The model id in a listing line's id column, or null when that column is not
- *  an id at all.
- *
- *  `runText` folds stderr into stdout and ignores the exit status, so whatever
- *  a CLI printed when it could not list models arrives here as if it were a
- *  catalog — and the exit status would not have saved us. Measured against a
- *  real cursor-agent: an account with nothing provisioned prints
- *  "No models available for this account." and exits 0. That line used to
- *  become a selectable model with the id "No", merged AHEAD of the built-in
- *  preset, so the picker offered "No" and the real defaults vanished.
- *
- *  An id occupies its whole column — `auto`, `gpt-5.5`, `gemini-3.8-flash-high`
- *  — and prose does not. That test needs no vendor's error wording, which is
- *  the point: the next CLI's phrasing, in a locale we have never seen, still
- *  fails it. */
+/** Even a successful CLI may print prose such as "No models available".
+ * Only a complete ID column is a selectable model. */
 function modelIdToken(column: string): string | null {
   if (!column || /\s/.test(column)) return null
   // "Error:", "Warning:" — a bare word wearing sentence punctuation, which can
   // survive the column rule when a CLI aligns its message.
   if (/^[a-z]+[.:,;!?]+$/i.test(column)) return null
-  return column.match(/^[a-z0-9][\w./:@+-]*$/i)?.[0] ?? null
+  return modelIdOrNull(column)
 }
 
 /** Parse model-list output shared by OpenCode, pi, Cursor and Antigravity. Exported so new
@@ -301,11 +299,10 @@ export function parseListedModels(text: string, style: 'provider' | 'pi' | 'curs
     let id: string | null = null
     let label: string | null = null
     let recommendedFor: Array<'big' | 'small'> | undefined
-    if (style === 'provider') {
-      id = line.match(/(?:^|\s)([a-z0-9][\w.-]*\/[\w./:@+-]+)/i)?.[1] ?? null
-    } else if (style === 'pi') {
-      id = line.match(/(?:^|\s)([a-z0-9][\w.-]*\/[\w./:@+-]+)/i)?.[1] ?? null
-      if (!id) {
+    if (style === 'provider' || style === 'pi') {
+      const candidate = modelIdToken(splitIdColumn(line)[0])
+      if (candidate?.includes('/')) id = candidate
+      if (!id && style === 'pi') {
         const pair = line.replace(/^[*✓>•-]+\s*/, '').split(/\s+/)
         if (pair.length >= 2 && /^[a-z0-9][\w.-]*$/i.test(pair[0]) && /^[a-z0-9][\w.:@/+-]*[-.:/][\w.:@/+-]*$/i.test(pair[1])) {
           id = `${pair[0]}/${pair[1]}`
@@ -326,8 +323,12 @@ export function parseListedModels(text: string, style: 'provider' | 'pi' | 'curs
         if (recs.length) recommendedFor = recs
       }
     } else {
-      const candidate = modelIdToken(splitIdColumn(line)[0])
-      if (candidate && !/^(available|current|default|name|model)$/i.test(candidate)) id = candidate
+      const [column, labelPart] = splitIdColumn(line)
+      const candidate = modelIdToken(column)
+      if (candidate && !/^(available|current|default|id|name|model)$/i.test(candidate)) {
+        id = candidate
+        label = labelPart || candidate
+      }
     }
     const normalized = clean(id, 160)
     if (normalized) {
@@ -351,77 +352,37 @@ interface CodexListItem {
   serviceTiers?: unknown
 }
 
-function discoverCodex(command: string, env: NodeJS.ProcessEnv): Promise<{ models: EngineModelOption[]; defaultModel: string | null } | null> {
-  return new Promise((resolve) => {
-    const invocation = versionCommandInvocation(command, [...CODEX_RUNTIME_CONFIG_ARGS, 'app-server', '--listen', 'stdio://'])
-    let child: ReturnType<typeof spawn>
-    try {
-      child = spawn(invocation.command, invocation.args, {
-        env: codexRuntimeEnv(env),
-        stdio: ['pipe', 'pipe', 'ignore'],
-        windowsHide: true,
-        windowsVerbatimArguments: invocation.windowsVerbatimArguments === true,
+async function discoverCodex(command: string, env: NodeJS.ProcessEnv, providerArgs: string[]): Promise<{ models: EngineModelOption[]; defaultModel: string | null } | null> {
+  const models: EngineModelOption[] = []
+  let defaultModel: string | null = null
+  let cursor: string | null = null
+  const cursors = new Set<string>()
+  const deadline = Date.now() + MODEL_PROBE_TIMEOUT_MS
+  let remainingBytes = MODEL_OUTPUT_LIMIT
+  for (let page = 0; page < 8; page++) {
+    if (Date.now() >= deadline || remainingBytes <= 0) return null
+    const result = await readCodexRpc(command, [...CODEX_RUNTIME_CONFIG_ARGS, ...providerArgs], env,
+      'model/list', { includeHidden: false, limit: 128, ...(cursor ? { cursor } : {}) },
+      { timeoutMs: deadline - Date.now(), maxBytes: remainingBytes })
+    if (!Array.isArray(result?.data)) return null
+    remainingBytes -= Buffer.byteLength(JSON.stringify(result))
+    for (const row of result.data as CodexListItem[]) {
+      const id = modelIdOrNull(typeof row.model === 'string' ? row.model : typeof row.id === 'string' ? row.id : null)
+      if (!id) continue
+      models.push({ id, label: clean(row.displayName, 160) ?? id, description: clean(row.description, 320),
+        recommendedFor: row.isDefault === true ? ['big'] : undefined,
+        ...(Array.isArray(row.serviceTiers) ? {
+          supportsFastMode: row.serviceTiers.some((tier) => tier?.id === 'fast' || tier?.id === 'priority'),
+        } : {}),
       })
-    } catch {
-      resolve(null)
-      return
+      if (row.isDefault === true) defaultModel = id
     }
-    child.stdin?.on('error', () => { /* close/error below owns the result */ })
-    let settled = false
-    let buffer = ''
-    const finish = (value: { models: EngineModelOption[]; defaultModel: string | null } | null) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      stopChild(child)
-      resolve(value)
-    }
-    const send = (message: object) => {
-      try { child.stdin?.write(`${JSON.stringify(message)}\n`) } catch { finish(null) }
-    }
-    const timer = setTimeout(() => finish(null), MODEL_PROBE_TIMEOUT_MS)
-    timer.unref?.()
-    child.once('error', () => finish(null))
-    child.once('close', () => finish(null))
-    child.stdout?.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString('utf8')
-      for (;;) {
-        const newline = buffer.indexOf('\n')
-        if (newline < 0) break
-        const line = buffer.slice(0, newline).trim()
-        buffer = buffer.slice(newline + 1)
-        if (!line.startsWith('{')) continue
-        let message: { id?: unknown; result?: { data?: unknown } }
-        try { message = JSON.parse(line) as typeof message } catch { continue }
-        if (message.id === 1) {
-          send({ jsonrpc: '2.0', method: 'initialized', params: {} })
-          send({ jsonrpc: '2.0', id: 2, method: 'model/list', params: { includeHidden: false, limit: 128 } })
-          continue
-        }
-        if (message.id !== 2 || !Array.isArray(message.result?.data)) continue
-        const rows = message.result.data as CodexListItem[]
-        const models = rows.map((row): EngineModelOption | null => {
-          const id = clean(row.model, 160) ?? clean(row.id, 160)
-          if (!id) return null
-          return {
-            id,
-            label: clean(row.displayName, 160) ?? id,
-            description: clean(row.description, 320),
-            recommendedFor: row.isDefault === true ? ['big'] : undefined,
-            ...(Array.isArray(row.serviceTiers) ? {
-              supportsFastMode: row.serviceTiers.some((tier) => tier?.id === 'fast' || tier?.id === 'priority'),
-            } : {}),
-          }
-        }).filter((row): row is EngineModelOption => row !== null)
-        const defaultModel = rows.find((row) => row.isDefault === true)
-        finish({ models, defaultModel: clean(defaultModel?.model, 160) ?? clean(defaultModel?.id, 160) })
-      }
-    })
-    send({
-      jsonrpc: '2.0', id: 1, method: 'initialize',
-      params: { clientInfo: { name: 'cumora-daemon', version: '1.0.0' }, capabilities: { experimentalApi: true } },
-    })
-  })
+    cursor = typeof result.nextCursor === 'string' ? result.nextCursor : null
+    if (!cursor || models.length >= MAX_CATALOG_MODELS) return { models: models.slice(0, MAX_CATALOG_MODELS), defaultModel }
+    if (cursors.has(cursor)) return null
+    cursors.add(cursor)
+  }
+  return null
 }
 
 /** Discover the account/config-specific catalog without making a model call.
@@ -437,53 +398,122 @@ export async function discoverEngineModelCatalog(
 ): Promise<EngineModelCatalog> {
   const preset = clonePreset(id)
   if (!binPath) return preset
-  const cacheKey = `${id}\u0000${binPath}`
+  // Unreadable configuration cannot establish which connection owns old rows.
+  const failed = (): EngineModelCatalog => ({
+    ...preset, models: [], defaultModel: null, defaultFastModel: null, stale: true,
+  })
+  // Native listings already resolve all configured backend providers. Re-read
+  // them on a rescan rather than caching under an unknown connection identity.
+  const listing = {
+    cursor: ['models', 'cursor'], opencode: ['models', 'provider'],
+    pi: ['--list-models', 'pi'], antigravity: ['models', 'antigravity'],
+    grok: ['models', 'cursor'],
+  } as const
+  if (id in listing) {
+    const [arg, style] = listing[id as keyof typeof listing]
+    const output = await runText(binPath, [arg], env)
+    const models = output === null ? [] : parseListedModels(output, style)
+    return models.length || output === '' ? fromDiscovered(id, models, 'cli', null) : preset
+  }
+  if (id === 'gemini' || id === 'qwen' || id === 'zcode') {
+    try {
+      const configured = configuredEngineModels(id, env)
+      return configured ? { ...fromDiscovered(id, configured.models, 'cli', configured.defaultModel),
+        defaultFastModel: null, prefersLocalDefault: true } : preset
+    } catch { return failed() }
+  }
+  if (id !== 'claude' && id !== 'codex') return preset
+  const settings = id === 'claude' ? readClaudeUserSettings(env) : null
+  if (settings?.readFailure) return failed()
+  const coreEnv = id === 'claude' ? withClaudeUserSettingsEnv(env) : env
+  let codex
+  try {
+    if (id === 'codex') codex = await codexProviderRuntime(binPath, env)
+  } catch { return failed() }
+  const identity = id === 'claude'
+    ? [coreEnv.ANTHROPIC_BASE_URL, coreEnv.ANTHROPIC_API_KEY, coreEnv.ANTHROPIC_AUTH_TOKEN]
+    : [codex?.provider.identity, codexAuthFingerprint()]
+  const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+  const cacheKey = `${id}\0${binPath}\0${hash(identity)}`
+  const fingerprint = id === 'claude' ? hash([settings, coreEnv.ANTHROPIC_MODEL, coreEnv.ANTHROPIC_DEFAULT_OPUS_MODEL,
+    coreEnv.ANTHROPIC_DEFAULT_SONNET_MODEL, coreEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, coreEnv.ANTHROPIC_SMALL_FAST_MODEL])
+    : hash([codexProviderFingerprint(env), readProviderCatalogFile(codex?.provider.catalogFile ?? null)])
   const cached = catalogCache.get(cacheKey)
-  if (!refresh && cached && Date.now() - cached.at < MODEL_CACHE_TTL_MS) return cached.catalog
+  if (!refresh && cached && cached.fingerprint === fingerprint && Date.now() - cached.at < MODEL_CACHE_TTL_MS) return cached.catalog
 
   let catalog: EngineModelCatalog | null = null
-  if (id === 'claude') {
-    const settings = readClaudeUserSettings(env)
-    const coreEnv = withClaudeUserSettingsEnv(env)
-    const defaultFastModel = clean(coreEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, 160)
-      ?? clean(coreEnv.ANTHROPIC_SMALL_FAST_MODEL, 160)
-    const prefersLocalDefault = isCustomAnthropicEndpoint(clean(coreEnv.ANTHROPIC_BASE_URL, 4096))
-    const configured = [settings.defaultModel, defaultFastModel]
-      .filter((model): model is string => !!model)
-      .map((model) => ({ id: model, label: model }))
-    if (configured.length || prefersLocalDefault) {
-      catalog = {
-        ...preset,
-        // Anthropic aliases are useful first-party presets, but claiming they
-        // exist on an arbitrary custom endpoint is misleading. Operators can
-        // still type any provider-specific id via supportsCustom.
-        models: mergeModels(configured, prefersLocalDefault ? [] : preset.models),
-        defaultModel: settings.defaultModel,
+  let remoteModels = cached?.remote
+  let protocolModels = cached?.protocol
+  if (id === 'claude' && settings) {
+    const defaultFastModel = modelIdOrNull(coreEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL)
+      ?? modelIdOrNull(coreEnv.ANTHROPIC_SMALL_FAST_MODEL)
+    const prefersLocalDefault = isCustomAnthropicEndpoint(coreEnv.ANTHROPIC_BASE_URL)
+    const defaultModel = modelIdOrNull(coreEnv.ANTHROPIC_MODEL) ?? settings.defaultModel
+    const mapped = [defaultModel, coreEnv.ANTHROPIC_DEFAULT_OPUS_MODEL, coreEnv.ANTHROPIC_DEFAULT_SONNET_MODEL,
+      coreEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, coreEnv.ANTHROPIC_SMALL_FAST_MODEL]
+      .filter((model): model is string => !!model).map(id => ({ id, label: id }))
+    let remote: EngineModelOption[] | null = null
+    const hasPicker = settings.models !== undefined
+    if (!hasPicker && prefersLocalDefault && coreEnv.ANTHROPIC_BASE_URL) {
+      try {
+        const base = new URL(coreEnv.ANTHROPIC_BASE_URL)
+        if (['http:', 'https:'].includes(base.protocol) && !base.username && !base.password) {
+          const path = base.pathname.replace(/\/+$/, '')
+          base.pathname = `${path}${/\/v1$/.test(path) ? '' : '/v1'}/models`
+          base.hash = ''
+          const token = coreEnv.ANTHROPIC_AUTH_TOKEN
+          const key = coreEnv.ANTHROPIC_API_KEY
+          remote = await fetchProviderModels({ url: base.href, headers: {
+            'anthropic-version': '2023-06-01', ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            ...(key ? { 'x-api-key': key } : {}),
+          } })
+        }
+      } catch { /* Only local declarations remain available. */ }
+    }
+    const configured = mergeModels(settings.models ?? [], mapped)
+    remoteModels = hasPicker ? undefined : remote ?? cached?.remote
+    if (hasPicker || configured.length || prefersLocalDefault || remote !== null) {
+      catalog = { ...preset,
+        models: mergeModels(configured, remoteModels ?? (hasPicker || prefersLocalDefault ? [] : preset.models))
+          .map(model => prefersLocalDefault ? { ...model, supportsFastMode: false } : model),
+        defaultModel,
         defaultFastModel: defaultFastModel ?? (prefersLocalDefault ? null : preset.defaultFastModel),
-        prefersLocalDefault,
-        source: 'cli',
-        // First-party aliases are runnable by any Anthropic account; on a custom
-        // endpoint they were not merged at all.
-        trustedModels: true,
+        prefersLocalDefault, source: 'cli', trustedModels: true,
+        ...(!hasPicker && prefersLocalDefault && coreEnv.ANTHROPIC_BASE_URL && remote === null ? { stale: true } : {}),
       }
     }
-  } else if (id === 'codex') {
-    const result = await discoverCodex(binPath, env)
-    if (result?.models.length) catalog = fromDiscovered(id, result.models, 'protocol', result.defaultModel)
-  } else if (id === 'cursor') {
-    const models = parseListedModels(await runText(binPath, ['models']), 'cursor')
-    if (models.length) catalog = fromDiscovered(id, models, 'cli', null)
-  } else if (id === 'opencode') {
-    const models = parseListedModels(await runText(binPath, ['models']), 'provider')
-    if (models.length) catalog = fromDiscovered(id, models, 'cli', null)
-  } else if (id === 'pi') {
-    const models = parseListedModels(await runText(binPath, ['--list-models']), 'pi')
-    if (models.length) catalog = fromDiscovered(id, models, 'cli', null)
-  } else if (id === 'antigravity') {
-    const models = parseListedModels(await runText(binPath, ['models']), 'antigravity')
-    if (models.length) catalog = fromDiscovered(id, models, 'cli', null)
+  } else if (codex) {
+    const { provider, env: runtimeEnv } = codex
+    const result = await discoverCodex(binPath, runtimeEnv, provider.args)
+    const remote = !result && !cached?.protocol && provider.connection ? await fetchProviderModels(provider.connection) : null
+    const local = readProviderCatalogFile(provider.catalogFile)
+    if (provider.defaultModel && !local.some(model => model.id === provider.defaultModel)) {
+      local.push({ id: provider.defaultModel, label: provider.defaultModel })
+    }
+    remoteModels = result || cached?.protocol ? undefined : remote ?? cached?.remote
+    protocolModels = result?.models ?? cached?.protocol
+    if (result || remote !== null || local.length || cached) {
+      const protocol = protocolModels ?? []
+      const native = new Map(protocol.map(model => [model.id, model]))
+      const explicit = local.map(model => ({ ...native.get(model.id), ...model,
+        label: model.label !== model.id ? model.label : native.get(model.id)?.label ?? model.label,
+        description: model.description ?? native.get(model.id)?.description,
+        ...(!native.has(model.id) ? { supportsFastMode: false } : {}),
+      }))
+      const rows = mergeModels(explicit, mergeModels(protocol, (remoteModels ?? [])
+        .map(model => ({ ...model, supportsFastMode: false }))))
+      catalog = { ...fromDiscovered(id, rows, 'protocol', provider.defaultModel ?? result?.defaultModel ?? null),
+        prefersLocalDefault: provider.prefersLocalDefault,
+        ...(provider.prefersLocalDefault ? { defaultFastModel: null } : {}),
+        ...(!result ? { stale: true } : {}),
+      }
+    }
   }
 
-  if (catalog) catalogCache.set(cacheKey, { at: Date.now(), catalog })
+  if (!catalog && cached) return { ...cached.catalog, stale: true }
+  if (catalog) {
+    if (catalogCache.size >= 64 && !catalogCache.has(cacheKey)) catalogCache.delete(catalogCache.keys().next().value!)
+    catalogCache.set(cacheKey, { at: Date.now(), fingerprint, catalog, remote: remoteModels, protocol: protocolModels })
+  }
   return catalog ?? preset
 }

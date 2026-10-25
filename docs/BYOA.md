@@ -65,9 +65,10 @@ errors and `--doctor` also point to it. While authentication is linked, logging
 in updates the shared personal credentials too. Use personal Codex to log out
 of the shared account. Account quota is shared. Codex still owns token refresh
 and recovery; a revoked or unrefreshable login requires signing in again.
-The persistent app-server and model discovery read the runtime's `config.toml`;
-add any needed `model` or
-`model_providers` settings there. Secure `exec` ignores user config.
+An independent runtime `config.toml` takes precedence. Otherwise Cumora projects
+the personal configuration's selected provider and model fields into the runtime.
+App-server, discovery and secure `exec` use the same projection; secure `exec`
+continues to ignore all other user configuration.
 
 Main threads resume after daemon restarts: macOS/Linux use app-server, while
 Windows and app-server fallbacks use `exec --json` / `exec resume <thread-id>`.
@@ -114,6 +115,80 @@ clear authentication failures.
 Migration leaves personal history and previously generated memories in place;
 review them through personal Codex separately. To start an old agent fresh,
 move its `codex.session` pointer aside while the daemon is stopped.
+
+## Provider model catalogs
+
+The model pickers follow each local engine's active provider connection. Claude
+imports explicit `modelPicker.options` and Opus/Sonnet/Haiku/auxiliary model
+mappings. Codex resolves its effective configuration through `config/read` and
+projects only the selected connection, model and catalog fields into the
+isolated runtime. An independent `~/.cumora/codex-runtime/config.toml` takes
+precedence over personal Codex configuration. Personal hooks, MCP servers,
+permissions, project configuration and conversation state are not imported.
+
+An explicit engine picker or a successful native listing takes precedence over
+a generic HTTP catalog. HTTP discovery fills in when that engine has no picker
+or native result; it does not inflate an existing engine namespace. Claude
+still includes its explicit default-model mappings, and Codex its explicit
+model/catalog configuration. Explicit labels take precedence for display.
+Choices are deduplicated by exact executable ID within the same engine and
+provider connection. Display names do not affect model identity or the ID
+submitted to the engine. Engine-specific aliases and context suffixes are
+preserved; Cumora does not add or remove suffixes or resolve routing groups to
+underlying models.
+
+Discovery covers backend vendors through the engine that uses them:
+
+| Engine | Catalog source |
+| --- | --- |
+| Claude Code | User picker and model mappings; HTTP fallback when no picker is declared |
+| Codex | Native `model/list`, selected provider/model/catalog configuration; HTTP fallback without a native result |
+| Grok, Cursor, OpenCode, Antigravity | Native `models` command |
+| pi | Native `--list-models` command |
+| Gemini | User `.gemini/settings.json` model definitions, aliases and default; `GEMINI_CLI_HOME` replaces the user home |
+| Qwen | User `settings.json` declarations for the active auth protocol; `QWEN_HOME` is honored |
+| ZCode | Enabled providers in `v2/config.json` and desktop `v2/provider_config.json`; `ZCODE_HOME` and `ZCODE_PROVIDER` are honored |
+| Maka | The current ACP adapter does not expose model selection |
+
+Native CLI commands resolve their own provider configuration and are re-read on
+each rescan, with the daemon environment and a neutral working directory.
+Gemini/Qwen configuration discovery reads user settings, not project settings or
+enterprise policy layers. Qwen does not offer image-only/realtime-only routes
+or models belonging to another auth protocol. Ambiguous Qwen IDs registered
+against different endpoints/credentials are withheld because `--model` alone
+cannot identify the intended route. ZCode uses its native ACP
+`provider\model` selector, so equal model IDs from different providers remain
+distinct. Custom provider model additions and deletions from the ZCode desktop
+configuration take precedence over its legacy provider snapshot.
+Explicitly disabled ZCode model rules also remove legacy builtin entries.
+
+HTTP discovery uses only the configured API's standard models resource or an
+explicit same-origin catalog URL, with the connection's own credentials. It
+does not scan other endpoints or test models through inference. Requests have
+a short timeout, a 2 MiB total response bound, at most eight pages and at most
+1,024 choices. Credentials and connection details remain local.
+
+Connection changes affect subsequent turns. Persistent sessions finish their
+active turn and reload while idle; explicit agent/computer model pins still
+win. Unreadable provider configuration pauses new secure turns instead of
+falling back to a different account. Secure execution, auxiliary tasks and diagnostics receive the same
+provider projection. For a known Claude/Codex connection, if a refresh fails,
+the picker retains the previous
+directory for that connection and reports it as stale. A successful empty
+listing clears that listing's previous entries; explicit local declarations
+remain. If configuration cannot establish the active connection, old choices
+are withheld until it becomes readable. Native-only listings are not cached
+under an unknown provider identity; a failed rescan therefore withholds their
+old entries. Custom ID entry stays available where the engine supports it.
+
+On Windows, structured provider settings bypass batch wrappers through a native
+Codex executable or the resolved npm/pnpm JavaScript entry point. An arbitrary
+wrapper without a direct entry point fails explicitly rather than expanding
+percent sequences or modifying credential values through `cmd.exe`.
+
+A catalog entry records configuration or a provider listing, not a successful
+execution. Generic HTTP entries do not establish tool, context, reasoning or
+native Fast Mode support. Native CLI capability metadata takes precedence.
 
 ## The Computer — the unifying host concept
 
@@ -301,7 +376,7 @@ interface EngineSession {
 
 | Concern | Claude Code | Codex CLI | Grok Build | Cursor Agent | OpenCode | pi | Gemini CLI | Qwen Code | Antigravity | ZCode |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Secure default | Claude Code ≥ 2.1.248 with `--restricted`; no Bash/PowerShell/web tools; host-home reads, command network, unsandboxed retry, and subprocess credentials are denied | Codex ≥ 0.138.0 with a custom permission profile: only minimal runtime reads plus the agent home; command network disabled; tool env allowlisted; user/project config, rules, hooks, apps, remote plugins, and multi-agent tools ignored or disabled | disabled | disabled | disabled | disabled | disabled | disabled | disabled | disabled |
+| Secure default | Claude Code ≥ 2.1.248 with `--restricted` and sandboxed Bash; PowerShell/web tools, host-home reads, command network, unsandboxed retry, and subprocess credentials are denied | Codex ≥ 0.138.0 with a custom permission profile: only minimal runtime reads plus the agent home; command network disabled; tool env allowlisted; user/project config, rules, hooks, apps, remote plugins, and multi-agent tools ignored or disabled | disabled | disabled | disabled | disabled | disabled | disabled | disabled | disabled |
 | Platform | macOS, Linux, WSL2; native Windows disabled because Claude's sandbox is unsupported there | macOS, Linux, WSL2, native Windows | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only |
 | Persistent session | secure default; `claude -p --input-format stream-json --output-format stream-json --verbose` | compatibility opt-in only; secure default uses one-shot `exec` | compatibility opt-in ACP | none | none | compatibility opt-in RPC | none | none — 0.22.3 has no stream-json INPUT mode | compatibility bidirectional stream-json | compatibility ACP via the `zcode-acp-server` bridge |
 | Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | inlined into each secure one-shot wake | compatibility ACP `_meta.rules` | inlined | inlined | compatibility `--append-system-prompt` | inlined | inlined | inlined | inlined |
@@ -366,9 +441,13 @@ crossing a vendor-specific deployment pin into the wrong namespace.
 The daemon advertises and schedules only engines for which it can impose a
 fail-closed host boundary:
 
-- Claude Code on macOS, Linux, and WSL2 runs in restricted mode with filesystem
-  isolation, an empty strict network allowlist, no Bash/PowerShell/web tools,
-  no unsandboxed retry, and an explicit deny list for every inherited
+- Claude Code on macOS, Linux, and WSL2 runs in restricted mode with sandboxed
+  Bash for local scripts, tests, and builds. Keep projects and build caches under
+  the agent's `workspace/`; dependencies must already be available because command
+  network access is denied. Cumora actions use the fixed MCP bridge, not a shell
+  CLI. The policy retains filesystem isolation, an empty strict network allowlist,
+  no PowerShell/web tools, no commands excluded from sandboxing, no unsandboxed
+  retry, and an explicit deny list for every inherited
   environment variable not needed by the fixed Cumora MCP bridge. Because
   restricted mode ignores user settings, the daemon imports a fixed
   seven-key allowlist from Claude's user settings into the trusted Claude
@@ -384,7 +463,9 @@ fail-closed host boundary:
   `api.anthropic.com` is *not* treated as a custom provider, while a
   `ANTHROPIC_BASE_URL` that won't parse is (it fails toward "custom"). Claude
   Code 2.1.248 or newer is required. Linux/WSL2 also requires `bubblewrap` and
-  `socat`; a missing dependency fails the turn.
+  `socat`; a missing dependency fails the turn. Sandbox availability also depends
+  on the host environment; if initialization fails, the turn stops without
+  disabling sandboxing.
 - Codex uses an isolated runtime home. Its one-shot fallback ignores user
   config and exec-policy rules. A custom
   permission profile permits minimal runtime reads and writes only under the

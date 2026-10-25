@@ -8,6 +8,9 @@ test('a model id is one token vendors actually use', () => {
   assert.equal(parseModelId('claude-sonnet-4-5'), 'claude-sonnet-4-5')
   assert.equal(parseModelId(' my-provider/some-model '), 'my-provider/some-model')
   assert.equal(parseModelId('gpt-5.4-mini'), 'gpt-5.4-mini')
+  assert.equal(parseModelId('auto/dfmodel[1m]'), 'auto/dfmodel[1m]')
+  assert.equal(parseModelId('provider/model+thinking'), 'provider/model+thinking')
+  assert.equal(parseModelId('builtin:zai-coding-plan\\glm-model'), 'builtin:zai-coding-plan\\glm-model')
   assert.equal(parseModelId(''), null)
   assert.equal(parseModelId('   '), null)
   assert.equal(parseModelId(null), null)
@@ -16,7 +19,8 @@ test('a model id is one token vendors actually use', () => {
 })
 
 test('a model id cannot carry a shell metacharacter', () => {
-  for (const value of ['sonnet & calc.exe', 'sonnet|calc', 'sonnet;calc', 'a"b', 'a%PATH%', 'a b', '../x']) {
+  for (const value of ['sonnet & calc.exe', 'sonnet|calc', 'sonnet;calc', 'a"b', 'a%PATH%', 'a b', '../x',
+    'a/../x', 'a/./x', 'a[1m', 'a[1m][2m]', 'a\nb', 'a@host', 'provider\\..\\secret', 'provider\\../secret', 'p\\a\\b']) {
     assert.throws(() => parseModelId(value), InvalidModelIdError)
     assert.equal(modelIdOrNull(value), null)
   }

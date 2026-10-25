@@ -3,13 +3,26 @@
  *
  * Run: node --import tsx --test server/src/__tests__/agents-computer-model-catalog.test.ts
  */
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readClaudeUserSettings, withClaudeUserSettingsEnv } from '../agents/computer/claude-user-settings.js'
 import { clearModelCatalogCache, discoverEngineModelCatalog, parseListedModels } from '../agents/computer/model-catalog.js'
+
+// Metadata probes must never share the developer's real Codex home/login.
+const isolatedHome = await mkdtemp(join(tmpdir(), 'cumora-catalog-home-'))
+const originalEnv = { ...process.env }
+process.env.HOME = isolatedHome
+process.env.USERPROFILE = isolatedHome
+process.env.CODEX_HOME = join(isolatedHome, '.codex')
+delete process.env.OPENAI_BASE_URL
+after(async () => {
+  for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key]
+  Object.assign(process.env, originalEnv)
+  await rm(isolatedHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+})
 
 test('Codex discovers Fast Mode support from advertised service tiers', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-codex-tiers-'))
@@ -248,6 +261,45 @@ test('a listing keeps the preset fast default only when the account listed it', 
     clearModelCatalogCache()
     await cleanup()
   }
+})
+
+test('native Codex pagination retains a failed refresh and clears a successful empty listing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-codex-paged-'))
+  const state = join(root, 'state.json')
+  const script = join(root, 'catalog.cjs')
+  const bin = join(root, process.platform === 'win32' ? 'codex.cmd' : 'codex')
+  await writeFile(script, `
+const fs = require('node:fs')
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line)
+  if (!msg.id) return
+  let response = { result: {} }
+  if (msg.method === 'model/list') {
+    const state = JSON.parse(fs.readFileSync(${JSON.stringify(state)}, 'utf8'))
+    response = state.fail ? { error: { message: 'offline' } } : { result: state.empty ? { data: [] } :
+      msg.params.cursor ? { data: [{ model: 'auto/second', displayName: 'Second' }] } :
+      { data: [{ model: 'auto/first', isDefault: true }], nextCursor: 'second-page' } }
+  }
+  process.stdout.write(JSON.stringify({ id: msg.id, ...response }) + '\\n')
+})
+`)
+  await writeFile(bin, process.platform === 'win32'
+    ? `@echo off\r\n"${process.execPath}" "%~dp0catalog.cjs" %*\r\n`
+    : `#!/bin/sh\nexec node "${script}" "$@"\n`, { mode: 0o755 })
+  try {
+    await writeFile(state, '{}')
+    const listed = await discoverEngineModelCatalog('codex', bin, true)
+    assert.deepEqual(listed.models.map(model => model.id), ['auto/first', 'auto/second'])
+    await writeFile(state, '{"fail":true}')
+    const failed = await discoverEngineModelCatalog('codex', bin, true)
+    assert.equal(failed.stale, true)
+    assert.deepEqual(failed.models, listed.models)
+    await writeFile(state, '{"empty":true}')
+    const empty = await discoverEngineModelCatalog('codex', bin, true)
+    assert.equal(empty.stale, undefined)
+    assert.equal(empty.trustedModels, true)
+    assert.deepEqual(empty.models, [])
+  } finally { await rm(root, { recursive: true, force: true }) }
 })
 
 test('a CLI that listed nothing offers nothing, not a model named after its excuse', async () => {

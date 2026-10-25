@@ -13,6 +13,7 @@ import { getAdapter } from '../agents/computer/engine.js'
 import { clearModelCatalogCache, discoverEngineModelCatalog } from '../agents/computer/model-catalog.js'
 import { EngineSessionStore } from '../agents/computer/session-store.js'
 import { runWithSessionRecovery } from '../agents/computer/session-recovery.js'
+import { codexProviderFingerprint, prepareCodexProvider } from '../agents/computer/codex-provider.js'
 
 const execFileAsync = promisify(execFile)
 const IS_WIN = process.platform === 'win32'
@@ -48,6 +49,7 @@ if (process.argv.includes('--version')) {
     const m = JSON.parse(line)
     record(m)
     if (m.method === 'initialize') send({ id: m.id, result: {} })
+    if (m.method === 'config/read') send({ id: m.id, result: { config: JSON.parse(process.env.CODEX_TEST_PROVIDER_CONFIG || '{}') } })
     if (m.method === 'model/list') send({ id: m.id, result: { data: [{ id: 'fixture', model: 'fixture', isDefault: true }] } })
     if (m.method === 'thread/start' || m.method === 'thread/resume') send({ id: m.id, result: { thread: { id: m.params.threadId || 'fixture-thread' } } })
     if (m.method === 'turn/start') {
@@ -305,6 +307,100 @@ test('custom Codex arguments cannot re-enable native memory', async () => {
       assert.ok(call.argv.lastIndexOf(`memories.${key}=false`) > call.argv.lastIndexOf(`memories.${key}=true`))
     }
   }
+})
+
+test('provider bootstrap reaches secure exec, triage, doctor and catalog without importing personal execution settings', async () => {
+  await mkdir(source, { recursive: true })
+  await writeFile(join(source, 'config.toml'), 'model_provider="fixture"\nmodel="auto/main"\n')
+  const config = {
+    model_provider: 'fixture', model: 'auto/main',
+    model_providers: { fixture: { name: 'Fixture', base_url: 'http://127.0.0.1:1/v1', wire_api: 'responses',
+      experimental_bearer_token: 'fixture-provider-secret', requires_openai_auth: false } },
+    hooks: { command: 'do-not-import' }, mcp_servers: { unsafe: { command: 'do-not-import' } },
+    permissions: { unsafe: true },
+  }
+  const env = { ...process.env, CODEX_TEST_PROVIDER_CONFIG: JSON.stringify(config),
+    CUMORA_AGENT_IPC_DIR: join(root, 'ipc'), CUMORA_AGENT_MCP_SHIM: join(root, 'shim') }
+  const adapter = getAdapter('codex')
+  const signal = AbortSignal.timeout(10_000)
+  assert.equal((await adapter.run({ home: root, env, prompt: 'hello', onLog() {}, signal })).exitCode, 0)
+  await adapter.classify({ cwd: root, env, prompt: 'triage', signal })
+  await adapter.probe({ cwd: root, env, tier: 'small', signal })
+  const catalog = await discoverEngineModelCatalog('codex', join(bin, IS_WIN ? 'codex.cmd' : 'codex'), true, env)
+  assert.equal(catalog.defaultModel, 'auto/main')
+  assert.equal(catalog.defaultFastModel, null)
+  assert.doesNotMatch(JSON.stringify(catalog), /fixture-provider-secret|127\.0\.0\.1/)
+  const records = (await calls()).filter(call => call.argv?.includes('exec'))
+  assert.equal(records.length, 3)
+  for (const call of records) {
+    assert.ok(call.argv.includes('model_provider="fixture"'))
+    assert.ok(call.argv.includes('model="auto/main"'))
+    assert.ok(call.argv.includes('--ignore-user-config'))
+    assert.equal(call.argv.includes('gpt-5.4-mini'), false)
+    assert.doesNotMatch(call.argv.join('\n'), /do-not-import|permissions\.unsafe/)
+    assert.equal(call.home, codexRuntimeHome())
+  }
+  assert.ok((await calls()).filter(call => call.argv?.includes('app-server'))
+    .some(call => call.argv.includes('model_provider="fixture"')))
+})
+
+test('independent runtime provider configuration wins and later configuration changes invalidate the projection', async () => {
+  await mkdir(source, { recursive: true })
+  await writeFile(join(source, 'config.toml'), 'model="personal/model"\n')
+  await mkdir(destination, { recursive: true })
+  await writeFile(join(destination, 'config.toml'), 'model="runtime/model"\n')
+  const adapter = getAdapter('codex')
+  const run = async (model: string) => adapter.run({
+    home: root, env: { ...process.env, CODEX_TEST_PROVIDER_CONFIG: JSON.stringify({ model }),
+      CUMORA_AGENT_IPC_DIR: join(root, 'ipc'), CUMORA_AGENT_MCP_SHIM: join(root, 'shim') },
+    prompt: 'hello', onLog() {}, signal: AbortSignal.timeout(10_000),
+  })
+  assert.equal((await run('runtime/model')).exitCode, 0)
+  const previousFingerprint = codexProviderFingerprint(process.env)
+  await writeFile(join(destination, 'config.toml'), 'model="runtime/changed"\n')
+  assert.notEqual(codexProviderFingerprint(process.env), previousFingerprint)
+  assert.equal((await run('runtime/changed')).exitCode, 0)
+  const records = await calls()
+  assert.ok(records.filter(call => call.argv?.includes('app-server')).every(call => call.home === destination))
+  assert.deepEqual(records.filter(call => call.argv?.includes('exec')).map(call =>
+    call.argv.find((arg: string) => arg.startsWith('model='))), ['model="runtime/model"', 'model="runtime/changed"'])
+})
+
+test('agent-specific runtime plumbing does not duplicate Codex provider bootstrap', async () => {
+  await mkdir(source, { recursive: true })
+  await writeFile(join(source, 'config.toml'), 'model_provider="gateway"\n')
+  const config = JSON.stringify({ model_provider: 'gateway', model: 'gateway/model', model_providers: { gateway: {
+    name: 'Local gateway', base_url: 'https://gateway.invalid/v1', requires_openai_auth: false,
+    env_http_headers: { 'x-agent-id': 'CUMORA_AGENT_ID' },
+  } } })
+  const env = (agent: string) => ({ ...process.env, CODEX_TEST_PROVIDER_CONFIG: config,
+    CUMORA_AGENT_ID: agent, CUMORA_AGENT_IPC_DIR: join(root, agent, 'ipc'),
+    CUMORA_AGENT_MCP_SHIM: join(root, agent, 'shim') })
+  const first = env('first-agent')
+  const second = env('second-agent')
+  assert.notEqual(codexProviderFingerprint(first), codexProviderFingerprint(second))
+  const providers = await Promise.all([prepareCodexProvider('codex', first), prepareCodexProvider('codex', second)])
+  assert.deepEqual(providers.map(provider => provider.connection?.headers['x-agent-id']), ['first-agent', 'second-agent'])
+  assert.equal((await calls()).filter(call => call.method === 'config/read').length, 1)
+})
+
+test('a provider change finishes the active Codex turn before reloading an idle session', { skip: IS_WIN }, async () => {
+  await mkdir(source, { recursive: true })
+  const file = join(source, 'config.toml')
+  await writeFile(file, 'model="auto/main"\n')
+  const env = { ...process.env, CODEX_TEST_PROVIDER_CONFIG: '{"model":"auto/main"}',
+    CUMORA_AGENT_IPC_DIR: join(root, 'ipc'), CUMORA_AGENT_MCP_SHIM: join(root, 'shim') }
+  await prepareCodexProvider('codex', env)
+  const session = getAdapter('codex').startSession!({ home: root, env, onLog() {} })!
+  assert.ok(session)
+  try {
+    const turn = session.send('complete the active turn')
+    writeFileSync(file, 'model="auto/changed"\n')
+    assert.equal(session.alive, true)
+    assert.equal((await turn).exitCode, 0)
+    assert.equal(session.alive, false)
+    assert.equal(session.sessionId, 'fixture-thread')
+  } finally { await session.stop() }
 })
 
 test('persistent sessions resume the same thread after restart; wake probes are ephemeral', { skip: IS_WIN }, async () => {

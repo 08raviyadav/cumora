@@ -5,9 +5,13 @@
  * Import only validated, non-executable fields. Environment values enter the
  * trusted core; the adapter denies those names to model-spawned subprocesses.
  */
+import { createHash } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
+import type { EngineModelOption } from './model-catalog.js'
+import { modelIdOrNull } from './model-id.js'
+import { parseProviderModels } from './provider-models.js'
 
 const MAX_SETTINGS_BYTES = 1024 * 1024
 
@@ -18,6 +22,7 @@ export const CLAUDE_CORE_ENV_KEYS = [
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_MODEL',
   'ANTHROPIC_SMALL_FAST_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
@@ -111,6 +116,8 @@ export interface ClaudeUserSettings {
   defaultModel: string | null
   defaultFastModel: string | null
   prefersLocalDefault: boolean
+  models?: EngineModelOption[]
+  readFailure?: true
 }
 
 const EMPTY_SETTINGS: ClaudeUserSettings = {
@@ -145,32 +152,37 @@ export function readClaudeUserSettings(env: NodeJS.ProcessEnv = process.env): Cl
   try {
     const file = settingsPath(env)
     if (!file) return EMPTY_SETTINGS
-    if (statSync(file).size > MAX_SETTINGS_BYTES) return EMPTY_SETTINGS
+    if (statSync(file).size > MAX_SETTINGS_BYTES) return { ...EMPTY_SETTINGS, readFailure: true }
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return EMPTY_SETTINGS
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ...EMPTY_SETTINGS, readFailure: true }
     const record = parsed as Record<string, unknown>
     const rawEnv = record.env && typeof record.env === 'object' && !Array.isArray(record.env)
       ? record.env as Record<string, unknown>
       : {}
     const coreEnv: Partial<Record<ClaudeCoreEnvKey, string>> = {}
     for (const key of CLAUDE_CORE_ENV_KEYS) {
-      const value = cleanString(rawEnv[key], key === 'ANTHROPIC_SMALL_FAST_MODEL' ? 160 : 4096)
+      const raw = rawEnv[key]
+      const value = key.endsWith('_MODEL')
+        ? modelIdOrNull(typeof raw === 'string' ? raw : null)
+        : cleanString(raw, 4096)
       if (value) coreEnv[key] = value
     }
+    const picker = record.modelPicker
+    const options = picker && typeof picker === 'object' && 'options' in picker ? picker.options : undefined
     return {
       coreEnv,
       turnEnv: turnEnv(rawEnv),
       turnSettings: turnSettings(record),
-      defaultModel: cleanString(record.model, 160),
-      defaultFastModel: cleanString(rawEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, 160)
-        ?? cleanString(rawEnv.ANTHROPIC_SMALL_FAST_MODEL, 160),
+      defaultModel: coreEnv.ANTHROPIC_MODEL ?? modelIdOrNull(typeof record.model === 'string' ? record.model : null),
+      defaultFastModel: coreEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL ?? coreEnv.ANTHROPIC_SMALL_FAST_MODEL ?? null,
       // A custom endpoint owns its model namespace. When no explicit Agent pin
       // exists, the server must not replace that namespace with its Anthropic
       // deployment default even if the local config omits a named model.
       prefersLocalDefault: isCustomAnthropicEndpoint(coreEnv.ANTHROPIC_BASE_URL),
+      ...(Array.isArray(options) ? { models: parseProviderModels(options) } : {}),
     }
-  } catch {
-    return EMPTY_SETTINGS
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? EMPTY_SETTINGS : { ...EMPTY_SETTINGS, readFailure: true }
   }
 }
 
@@ -182,4 +194,14 @@ export function withClaudeUserSettingsEnv(env: NodeJS.ProcessEnv): NodeJS.Proces
     if (merged[key] === undefined && coreEnv[key] !== undefined) merged[key] = coreEnv[key]
   }
   return merged
+}
+
+/** Private change detector for idle persistent sessions. */
+export function claudeProviderFingerprint(env: NodeJS.ProcessEnv): string {
+  const settings = readClaudeUserSettings(env)
+  const effective = withClaudeUserSettingsEnv(env)
+  return createHash('sha256').update(JSON.stringify([
+    effective.ANTHROPIC_MODEL || settings.defaultModel, settings.turnSettings, settings.turnEnv,
+    CLAUDE_CORE_ENV_KEYS.map(key => effective[key]),
+  ])).digest('hex')
 }

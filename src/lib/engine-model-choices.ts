@@ -10,9 +10,9 @@
  * Only a catalog the daemon vouches for produces model rows. Two states do not:
  *
  * - `presets`: the engine never listed anything, so the ids are Cumora's
- *   compiled-in guesses about the account (gemini, qwen, zcode and maka are
- *   never probed at all). Offering them means offering models the account may
- *   not run, each inheritable by every Agent — so they are not offered at all.
+ *   compiled-in guesses about the account. Offering them means offering models
+ *   the account may not run, each inheritable by every Agent — so they are not
+ *   offered at all.
  * - `unverified`: a daemon that predates `trustedModels` reported a catalog
  *   after merging its presets into the provider's answer, while still labelling
  *   it `protocol`/`cli`. The tail is unvouched-for and indistinguishable from a
@@ -44,10 +44,11 @@ export interface ModelChoiceCatalog {
    *  itself (a provider profile), which is why `catalogTrust` treats absent as
    *  reported rather than as a failure. */
   source?: 'protocol' | 'cli' | 'presets'
-  /** Set by a daemon that promises every id above is runnable by this account.
+  /** Set by a daemon whose choices were explicitly configured or listed.
    *  Absent on daemons old enough to have merged their presets into a reported
    *  listing, which is the case `catalogTrust` calls `unverified`. */
   trustedModels?: boolean
+  stale?: boolean
 }
 
 export type CatalogTrust = 'reported' | 'guessed' | 'unverified' | 'missing'

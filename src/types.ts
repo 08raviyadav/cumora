@@ -25,10 +25,11 @@ export interface EngineModelCatalog {
   supportsCustom: boolean
   fastModelScope: 'agent' | 'computer' | 'unsupported'
   source: 'protocol' | 'cli' | 'presets'
-  /** Set by a daemon that promises every id in `models` is runnable by this
-   *  account. Absent on older daemons, whose catalogs merged built-in presets
+  /** Explicitly configured/listed choices, without a guarantee of execution.
+   *  Absent on older daemons, whose catalogs merged built-in presets
    *  into the reported list — the picker withholds those rows. */
   trustedModels?: boolean
+  stale?: boolean
 }
 
 export interface DetectedEngine {

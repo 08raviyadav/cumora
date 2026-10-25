@@ -475,6 +475,7 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'agent.providerMissing': '不可用：{id}',
   'agent.modelLabelByoa': '主力模型（大脑）',
   'agent.modelHintByoaCatalog': '从这台计算机上的引擎实际可用模型中选择；也可以搜索并输入自定义模型 ID。',
+  'agent.modelCatalogStale': '模型目录未能完整刷新，当前选项可能已过期；请检查引擎配置后刷新。实际可用性以执行结果为准。',
   'agent.modelCatalogGuessed': '该引擎没有报告模型列表，因此这里没有可选项。Cumora 只有内置猜测值，未必对你的账号可用——请直接输入模型 ID。',
   'agent.modelCatalogUnverified': '这台计算机的守护进程版本过旧，无法确认引擎实际可用的模型，因此列表已隐藏。请直接输入模型 ID，或在该计算机上升级守护进程后刷新。',
   'agent.fastHintByoaCatalog': '用于收件箱分流等轻量判断的成员级模型。留空时使用该引擎的小脑默认值。',

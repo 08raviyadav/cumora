@@ -4,6 +4,7 @@
  * Run: node --import tsx --test server/src/__tests__/agents-computer-engine.test.ts
  */
 import assert from 'node:assert/strict'
+import { writeFileSync } from 'node:fs'
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
@@ -19,6 +20,59 @@ const tempDirs: string[] = []
 // Sessions spawn a child process. Track them so a FAILING assertion still tears
 // the child down — otherwise it outlives the test and the runner never exits.
 const liveSessions: Array<{ stop(): void | Promise<void> }> = []
+
+test('Claude preserves an explicit model override and reloads changed providers after the active turn', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-provider-refresh-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  const configDir = join(root, 'config')
+  await Promise.all([mkdir(binDir), mkdir(home), mkdir(configDir)])
+  const file = join(configDir, 'settings.json')
+  const saved = (endpoint: string) => JSON.stringify({
+    model: 'auto/local[1m]', env: { ANTHROPIC_BASE_URL: endpoint },
+  })
+  await writeFile(file, saved('https://first.example.test'))
+  await writeFakeCli(binDir, 'claude', `
+if (process.argv.includes('--input-format')) {
+  process.stdin.on('data', () => process.stdout.write(JSON.stringify({
+    type: 'result', subtype: 'success', session_id: 'retained-thread', result: 'OK'
+  }) + '\\n'))
+} else {
+  process.stdout.write(JSON.stringify({ argv: process.argv.slice(2) }) + '\\n')
+}
+`)
+  setFakeCliPath(binDir)
+  const env = secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_MODEL: 'explicit/main' })
+  const adapter = getAdapter('claude')
+  const probe = await adapter.probe({ cwd: home, env, tier: 'big', signal: AbortSignal.timeout(10_000) })
+  const argv = JSON.parse(probe.text).argv as string[]
+  assert.equal(argv[argv.indexOf('--model') + 1], 'explicit/main')
+  const session = adapter.startSession!({ home, env, onLog() {} })!
+  assert.ok(session)
+  liveSessions.push(session)
+  const turn = session.send('finish this turn')
+  writeFileSync(file, saved('https://second.example.test'))
+  assert.equal(session.alive, true)
+  assert.equal((await turn).exitCode, 0)
+  assert.equal(session.alive, false)
+  assert.equal(session.sessionId, 'retained-thread')
+})
+
+test('temporarily unreadable Claude provider settings cannot fall through to a different account', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-partial-settings-'))
+  tempDirs.push(root)
+  const configDir = join(root, 'config')
+  const binDir = join(root, 'bin')
+  await Promise.all([mkdir(configDir), mkdir(binDir)])
+  await writeFile(join(configDir, 'settings.json'), '{partial gateway update')
+  await writeFakeCli(binDir, 'claude', "process.stderr.write('fixture must not be invoked')")
+  setFakeCliPath(binDir)
+  await assert.rejects(getAdapter('claude').classify({
+    cwd: root, env: secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir }),
+    prompt: 'triage', signal: AbortSignal.timeout(10_000),
+  }), /Cannot read Claude provider settings/)
+})
 
 function secureClaudeEnv(root: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const base: NodeJS.ProcessEnv = { ...process.env }

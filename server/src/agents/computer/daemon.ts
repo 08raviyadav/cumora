@@ -54,6 +54,7 @@ import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampl
 import { allowUnsandboxedByoa, classifyEngineFailure, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, loginCodexRuntime, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 import { EngineSessionStore, sessionIdPreview } from './session-store.js'
 import { CODEX_LOGIN_COMMAND, CODEX_MIGRATE_COMMAND, CODEX_SESSION_SCOPE, codexRuntimeHome } from './codex-runtime.js'
+import { cachedCodexProvider } from './codex-provider.js'
 import { migrateCodexSession, migrateCodexSessions } from './codex-session-migration.js'
 import { runWithSessionRecovery } from './session-recovery.js'
 
@@ -2516,7 +2517,10 @@ export class AgentRunner {
     if (pinned) return pinned
     if (this.adapter.id === 'claude') return 'haiku'
     if (this.adapter.id === 'grok') return 'grok-4.5'
-    if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
+    if (this.adapter.id === 'codex') {
+      const provider = cachedCodexProvider(this.engineEnv())
+      return provider?.prefersLocalDefault ? provider.defaultModel ?? '<codex-default>' : 'gpt-5.4-mini'
+    }
     if (this.adapter.id === 'gemini') return 'gemini-2.5-flash-lite'
     if (this.adapter.id === 'qwen') return 'qwen3-coder-flash'
     if (this.adapter.id === 'opencode') return this.agent.model ?? '<opencode-default>'

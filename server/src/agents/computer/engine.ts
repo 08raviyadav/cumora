@@ -27,13 +27,16 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { access, lstat, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
+import { dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
-import { isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
+import { CLAUDE_CORE_ENV_KEYS, claudeProviderFingerprint, isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersionWithRetry, versionCommandInvocation } from './cli-version.js'
 import { discoverEngineModelCatalog, type EngineModelCatalog } from './model-catalog.js'
 import { CODEX_RUNTIME_CONFIG_ARGS, codexAuthFingerprint, codexRuntimeEnv } from './codex-runtime.js'
+import { cachedCodexProvider, codexProviderEnv, codexProviderFingerprint, codexProviderRuntime, prepareCodexProvider } from './codex-provider.js'
+import { assertCodexProviderTransport, codexCommandInvocation } from './codex-rpc.js'
+import { modelIdOrNull } from './model-id.js'
 import { supportsNativeFastMode } from '../../../../shared/native-fast-mode.js'
 
 const IS_WIN = process.platform === 'win32'
@@ -368,19 +371,9 @@ function resolveCodexSpawn(): CodexSpawn {
     : fallback.command
   if (!/\.cmd$/i.test(shim)) return { ...fallback, argsPrefix: [] }
 
-  const shimDir = dirname(shim)
-  const script = join(shimDir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
-  if (!existsSync(script)) return { ...fallback, argsPrefix: [] }
-
-  const nodeCandidates = [
-    join(shimDir, 'node.exe'),
-    ...(process.env.PATH ?? '').split(PATH_DELIMITER).filter(Boolean).map((dir) => join(dir, 'node.exe')),
-  ]
-  const node = nodeCandidates.find((candidate) => existsSync(candidate))
-    ?? (/^node(?:\.exe)?$/i.test(basename(process.execPath)) ? process.execPath : null)
-  if (!node) return { ...fallback, argsPrefix: [] }
-
-  return { command: node, argsPrefix: [script], shell: false, wantsStdinPrompt: false }
+  const invocation = codexCommandInvocation(shim, [], process.env)
+  if (invocation.windowsVerbatimArguments) return { ...fallback, argsPrefix: [] }
+  return { command: invocation.command, argsPrefix: invocation.args, shell: false, wantsStdinPrompt: false }
 }
 
 /** Interactive setup uses exactly the same home as every background call. */
@@ -1340,7 +1333,7 @@ class ClaudeSession implements EngineSession {
   private steerQueue: string[] = []
   readonly carriesStandingPrompt: boolean
 
-  constructor(bin: string, args: string[], opts: EngineSessionArgs, carriesStandingPrompt: boolean) {
+  constructor(bin: string, args: string[], opts: EngineSessionArgs, carriesStandingPrompt: boolean, private readonly providerChanged: () => boolean) {
     this.onLog = opts.onLog
     this.onHopUsage = opts.onHopUsage
     this.resumePending = !!opts.resumeSessionId
@@ -1358,7 +1351,13 @@ class ClaudeSession implements EngineSession {
       this.die(code ?? (signalName ? 128 : 1), signalName ? `terminated by ${signalName}` : `exited with code ${code}`))
   }
 
-  get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
+  get alive(): boolean {
+    if (!this.pending && this.providerChanged()) {
+      void this.stop({ force: true })
+      return false
+    }
+    return !this.exited && this.child.stdin?.writable === true
+  }
   get sessionId(): string | null { return this.sid }
 
   send(prompt: string): Promise<EngineRunResult> {
@@ -1625,7 +1624,11 @@ export function claudeSecureFlags(agentHome: string, env: NodeJS.ProcessEnv, nat
  * denies those names to every model-spawned subprocess. Compatibility mode
  * keeps Claude's native settings loading and its already-explicit host risk. */
 function claudeCoreEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return allowUnsandboxedByoa(env) ? { ...env } : withClaudeUserSettingsEnv(env)
+  if (allowUnsandboxedByoa(env)) return { ...env }
+  if (readClaudeUserSettings(env).readFailure && !CLAUDE_CORE_ENV_KEYS.every(key => env[key] !== undefined)) {
+    throw new Error('Cannot read Claude provider settings; retry after its configuration has finished updating')
+  }
+  return withClaudeUserSettingsEnv(env)
 }
 
 /** Pick the small brain inside the local provider namespace. An explicit
@@ -1635,11 +1638,16 @@ function claudeCoreEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
  * URL is not a custom endpoint — Claude Code exports it into every child
  * process, so keying on "the variable is set" dropped Haiku for first-party
  * accounts. */
+function claudeMainModel(env: NodeJS.ProcessEnv, requested?: string | null): string | null {
+  return modelIdOrNull(requested || env.ANTHROPIC_MODEL || readClaudeUserSettings(env).defaultModel)
+}
+
 function claudeFastModelArgs(env: NodeJS.ProcessEnv, requested?: string | null): string[] {
   const model = requested?.trim()
     || env.CUMORA_TRIAGE_MODEL?.trim()
     || env.ANTHROPIC_DEFAULT_HAIKU_MODEL?.trim()
     || env.ANTHROPIC_SMALL_FAST_MODEL?.trim()
+    || (isCustomAnthropicEndpoint(env.ANTHROPIC_BASE_URL) ? claudeMainModel(env) : null)
   if (model) return ['--model', model]
   return isCustomAnthropicEndpoint(env.ANTHROPIC_BASE_URL) ? [] : ['--model', 'haiku']
 }
@@ -1666,7 +1674,7 @@ function claudeTurnEnv(env: NodeJS.ProcessEnv, fastModel?: string | null): NodeJ
 
 function claudeFastModeError(model: string | null | undefined, env: NodeJS.ProcessEnv, enabled: boolean): string | null {
   if (!enabled) return null
-  let resolved = model || readClaudeUserSettings(env).defaultModel
+  let resolved = claudeMainModel(env, model)
   if (/^opus(?:\[1m\])?$/i.test(resolved ?? '')) resolved = env.ANTHROPIC_DEFAULT_OPUS_MODEL || resolved
   if (!supportsNativeFastMode('claude', resolved)) {
     return 'Fast mode requires a supported Opus model; select one explicitly to avoid changing the selected model.'
@@ -1730,7 +1738,8 @@ class ClaudeAdapter implements EngineAdapter {
     // uses its default main reasoning brain. One token in, "OK" out — proves the binary runs
     // and that tier is authed/has quota, with NO tools/MCP/persona.
     const env = claudeCoreEnv(args.env)
-    const model = args.tier === 'small' ? claudeFastModelArgs(env) : []
+    const main = claudeMainModel(env)
+    const model = args.tier === 'small' ? claudeFastModelArgs(env) : main ? ['--model', main] : []
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const base = allowUnsandboxedByoa(env)
       ? ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
@@ -1764,10 +1773,12 @@ class ClaudeAdapter implements EngineAdapter {
     catch (err) { return { ok: false, detail: `could not write standing-prompt probe file: ${err instanceof Error ? err.message : String(err)}` } }
     const env = claudeCoreEnv(args.env)
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const main = claudeMainModel(env)
+    const model = main ? ['--model', main] : []
     const base = allowUnsandboxedByoa(env)
-      ? ['-p', '--output-format', 'text', '--append-system-prompt-file', promptFile, '--dangerously-skip-permissions']
+      ? ['-p', ...model, '--output-format', 'text', '--append-system-prompt-file', promptFile, '--dangerously-skip-permissions']
       : [
-          '-p', '--output-format', 'text', '--append-system-prompt-file', promptFile,
+          '-p', ...model, '--output-format', 'text', '--append-system-prompt-file', promptFile,
           '--restricted', '--tools', '', '--strict-mcp-config',
         ]
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
@@ -1809,7 +1820,8 @@ class ClaudeAdapter implements EngineAdapter {
     // the dangerous bypass remains only for explicit compatibility mode.
     // Big-brain model → --model; small-brain → ANTHROPIC_SMALL_FAST_MODEL env.
     const flags = unsafeEngineArgs('CUMORA_CLAUDE_ARGS')
-    const model = args.model ? ['--model', args.model] : []
+    const selectedModel = claudeMainModel(args.env, args.model)
+    const model = selectedModel ? ['--model', selectedModel] : []
     const env = claudeTurnEnv(args.env, args.fastModel)
     const fastMode = args.nativeFastMode ?? false
     if (fastMode && flags.length) return Promise.resolve({ exitCode: 1, error: 'Fast mode requires removing the CUMORA_CLAUDE_ARGS override so Cumora can preserve the selected model and settings.' })
@@ -1840,7 +1852,8 @@ class ClaudeAdapter implements EngineAdapter {
     // Respect a user's custom flag override (CUMORA_CLAUDE_ARGS) by NOT using the
     // persistent path — those flags are tuned for the one-shot run; fall back to run().
     if (unsafeEngineArgs('CUMORA_CLAUDE_ARGS').length) return null
-    const model = args.model ? ['--model', args.model] : []
+    const selectedModel = claudeMainModel(args.env, args.model)
+    const model = selectedModel ? ['--model', selectedModel] : []
     const env = claudeTurnEnv(args.env, args.fastModel)
     const fastMode = args.nativeFastMode ?? false
     if (claudeFastModeError(args.model, env, fastMode)) return null
@@ -1866,7 +1879,9 @@ class ClaudeAdapter implements EngineAdapter {
           '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
           ...resume, ...sys, ...model, ...claudeSecureFlags(args.home, env, fastMode),
         ]
-    return new ClaudeSession(this.bin, argv, { ...args, env }, carriesStanding)
+    const fingerprint = claudeProviderFingerprint(args.env)
+    return new ClaudeSession(this.bin, argv, { ...args, env }, carriesStanding,
+      () => claudeProviderFingerprint(args.env) !== fingerprint)
   }
 }
 
@@ -2035,6 +2050,7 @@ class CodexSession implements EngineSession {
   private readonly child: ChildProcess
   private readonly authHome: string
   private readonly authFingerprint: string | null | undefined
+  private readonly providerChanged: () => boolean
   private readonly onLog: (line: string) => void
   private readonly onHopUsage?: (r: EngineHopReport) => void
   /** Wall-clock when the CURRENT turn started (turn/start request sent), used to
@@ -2065,7 +2081,8 @@ class CodexSession implements EngineSession {
   private cum = { input: 0, cached: 0, output: 0 }
   private turnStart = { input: 0, cached: 0, output: 0 }
 
-  constructor(bin: string, spawnArgs: string[], home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
+  constructor(bin: string, spawnArgs: string[], home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs, providerChanged: () => boolean) {
+    this.providerChanged = providerChanged
     this.authHome = env.CODEX_HOME!
     this.authFingerprint = codexAuthFingerprint(this.authHome)
     this.onLog = opts.onLog
@@ -2100,6 +2117,11 @@ class CodexSession implements EngineSession {
   get alive(): boolean {
     if (this.exited || this.child.stdin?.writable !== true) return false
     if (!this.pending) {
+      if (this.providerChanged()) {
+        this.onLog('[codex] provider configuration changed; restarting the idle session')
+        void this.stop({ force: true })
+        return false
+      }
       const auth = codexAuthFingerprint(this.authHome)
       if (auth !== undefined && auth !== this.authFingerprint) {
         this.onLog('[codex] login changed; restarting the session with its saved thread')
@@ -2326,28 +2348,33 @@ class CodexAdapter implements EngineAdapter {
   readonly id = 'codex' as const
   readonly bin = 'codex'
 
-  classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
     // gpt-5.4-mini works with ChatGPT auth; arbitrary small API models do not.
     const flags = allowUnsandboxedByoa() ? extraArgs('CUMORA_TRIAGE_ARGS') : []
-    return this.capture(args, flags.length ? flags : ['--model', args.model || 'gpt-5.4-mini', '--skip-git-repo-check'])
+    const provider = await prepareCodexProvider(this.bin, args.env)
+    const model = args.model || (provider.prefersLocalDefault ? provider.defaultModel : 'gpt-5.4-mini')
+    return this.capture(args, flags.length ? flags : [...(model ? ['--model', model] : []), '--skip-git-repo-check'])
   }
 
-  probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
     // Omit --model for the big tier so Codex uses its configured default.
-    const model = args.tier === 'small' ? ['--model', triageModel('gpt-5.4-mini')] : []
+    const provider = await prepareCodexProvider(this.bin, args.env)
+    const selected = args.tier === 'small' ? triageModel(provider.prefersLocalDefault ? provider.defaultModel ?? '' : 'gpt-5.4-mini') : null
+    const model = selected ? ['--model', selected] : []
     return this.capture({ ...args, prompt: DOCTOR_PROMPT }, [...model, '--skip-git-repo-check'])
   }
 
-  private capture(args: EngineClassifyArgs, flags: string[]): Promise<EngineClassifyResult> {
-    const env = codexRuntimeEnv(args.env)
+  private async capture(args: EngineClassifyArgs, flags: string[]): Promise<EngineClassifyResult> {
+    const { env, provider } = await codexProviderRuntime(this.bin, args.env)
     const { command, shell, argsPrefix } = resolveCodexSpawn()
+    assertCodexProviderTransport(provider.args, shell)
     const exec = allowUnsandboxedByoa() ? ['exec'] : codexSecureExecArgs({ home: args.cwd, env }, true)
-    return spawnCapture(command, [...argsPrefix, ...exec, '--ephemeral', ...flags, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(false), '-'], {
+    return spawnCapture(command, [...argsPrefix, ...provider.args, ...exec, '--ephemeral', ...flags, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(false), '-'], {
       cwd: args.cwd, env, signal: args.signal, onLog: args.onLog, shell, stdinText: args.prompt,
     })
   }
 
-  probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+  async probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
     // Same gates as startSession()'s "fall back to one-shot exec" decision: when
     // any of these is true, the wake path collapses to `codex exec ...` which
     // probe() already covers — running the JSON-RPC probe would just add a false
@@ -2357,7 +2384,8 @@ class CodexAdapter implements EngineAdapter {
         || IS_WIN) {
       return Promise.resolve({ ok: true, detail: '', skipped: true })
     }
-    args = { ...args, env: codexRuntimeEnv(args.env) }
+    const { env, provider } = await codexProviderRuntime(this.bin, args.env)
+    args = { ...args, env }
     // The real wake spawns `codex app-server --listen stdio://` and drives a
     // JSON-RPC handshake (initialize → thread/start). The realistic breaks here
     // are: app-server subcommand removed/renamed; protocol field names changed
@@ -2378,7 +2406,7 @@ class CodexAdapter implements EngineAdapter {
         void terminateEngineTree(child).then(() => resolve(r))
       }
       const secure = allowUnsandboxedByoa() ? [] : codexSecureConfigOverrides({ home: args.cwd, env: args.env }, true)
-      const appServerArgs = [...argsPrefix, ...secure, ...CODEX_RUNTIME_CONFIG_ARGS, 'app-server', '--listen', 'stdio://']
+      const appServerArgs = [...argsPrefix, ...provider.args, ...secure, ...CODEX_RUNTIME_CONFIG_ARGS, 'app-server', '--listen', 'stdio://']
       const child = spawnEngineChild(command, appServerArgs, {
         cwd: args.cwd, env: args.env, stdio: ['pipe', 'pipe', 'pipe'], shell,
       })
@@ -2451,12 +2479,13 @@ class CodexAdapter implements EngineAdapter {
     await atomicAgentWrite(join(home, 'AGENTS.md'), PERSONA_HEADER(persona))
   }
 
-  run(args: EngineRunArgs): Promise<EngineRunResult> {
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
     // `codex exec` is the non-interactive mode. Secure mode applies a custom
     // filesystem/network/environment profile and reaches Cumora only through
     // local IPC. Historical full-access flags and argv overrides remain
     // available exclusively behind the explicit compatibility opt-in.
-    args = { ...args, env: codexRuntimeEnv(args.env) }
+    const { env, provider } = await codexProviderRuntime(this.bin, args.env)
+    args = { ...args, env }
     const flags = unsafeEngineArgs('CUMORA_CODEX_ARGS')
     const base = flags.length
       ? ['exec', ...flags]
@@ -2468,10 +2497,11 @@ class CodexAdapter implements EngineAdapter {
     const resume = args.resumeSessionId ? ['resume', args.resumeSessionId] : []
     const { command, shell, argsPrefix } = resolveCodexSpawn()
     let sessionId = args.resumeSessionId ?? null
+    assertCodexProviderTransport(provider.args, shell)
     let usage: EngineUsage | undefined
     let turnError: string | undefined
     const started = Date.now()
-    return spawnEngine(command, [...argsPrefix, ...base, ...model, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(args.nativeFastMode ?? false), ...resume, '-'], args, {
+    return spawnEngine(command, [...argsPrefix, ...provider.args, ...base, ...model, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(args.nativeFastMode ?? false), ...resume, '-'], args, {
       shell, stdinText: args.prompt,
       onStdoutLine(line) {
         let event
@@ -2505,14 +2535,23 @@ class CodexAdapter implements EngineAdapter {
     if (unsafeEngineArgs('CUMORA_CODEX_ARGS').length
         || process.env.CUMORA_CODEX_NO_APP_SERVER === '1'
         || IS_WIN) return null
-    args = { ...args, env: codexRuntimeEnv(args.env) }
+    const originalEnv = args.env
+    const provider = cachedCodexProvider(originalEnv)
+    // First turn can prepare asynchronously through run(); never start on an
+    // unprepared connection just because this legacy interface is synchronous.
+    if (!provider) return null
+    args = { ...args, env: codexProviderEnv(provider, args.env) }
     try { ensureGitRepoForCodex(args.home) }
     catch (err) { args.onLog(`[codex] could not init git repo for app-server (${err instanceof Error ? err.message : String(err)}) — falling back to one-shot exec`); return null }
     const { command, argsPrefix } = resolveCodexSpawn()
     const secure = allowUnsandboxedByoa()
       ? []
       : codexSecureConfigOverrides({ home: args.home, env: args.env })
-    return new CodexSession(command, [...argsPrefix, ...secure, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(args.nativeFastMode ?? false), 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
+    return new CodexSession(command, [...argsPrefix, ...provider.args, ...secure, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(args.nativeFastMode ?? false), 'app-server', '--listen', 'stdio://'], args.home, args.env, args,
+      () => {
+        try { return codexProviderFingerprint(originalEnv) !== provider.fingerprint }
+        catch { return true }
+      })
   }
 }
 

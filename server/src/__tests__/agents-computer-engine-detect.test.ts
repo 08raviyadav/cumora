@@ -102,7 +102,7 @@ test('listAgentsForComputer keeps an explicit model and pins CUMORA_DEFAULT_* wh
   assert.equal(agents[4]?.engine, 'qwen')
 })
 
-test('listAgentsForComputer prefers a reported local default without overriding an explicit pin', async () => {
+test('listAgentsForComputer leaves local defaults dynamic without overriding an explicit pin', async () => {
   const catalog = {
     models: [{ id: 'provider/opus', label: 'Provider Opus' }],
     defaultModel: 'provider/opus',
@@ -136,12 +136,31 @@ test('listAgentsForComputer prefers a reported local default without overriding 
 
   const agents = await registry.listAgentsForComputer('comp-1')
   assert.equal(agents[0]?.model, 'agent/pin')
-  assert.equal(agents[0]?.fastModel, 'provider/haiku')
-  assert.equal(agents[1]?.model, 'provider/opus')
-  assert.equal(agents[1]?.fastModel, 'provider/haiku')
+  assert.equal(agents[0]?.fastModel, null)
+  assert.equal(agents[1]?.model, null, 'the daemon resolves the current provider default at execution time')
+  assert.equal(agents[1]?.fastModel, null)
   assert.equal(agents[2]?.model, null, 'custom provider with unnamed default must not inherit the deploy pin')
-  assert.equal(agents[2]?.fastModel, 'provider/haiku')
+  assert.equal(agents[2]?.fastModel, null)
   assert.equal('detectedEngines' in (agents[1] ?? {}), false)
+})
+
+test('provider defaults stay local for every engine while explicit computer pins win', async () => {
+  const catalog = { models: [], defaultModel: 'auto/current', defaultFastModel: null,
+    prefersLocalDefault: true, supportsCustom: true, fastModelScope: 'agent', source: 'protocol', trustedModels: true }
+  for (const engine of ['codex', 'gemini', 'qwen', 'zcode']) {
+    const computer = { availableEngines: [engine],
+      detectedEngines: [{ id: engine, bin: engine, path: `/bin/${engine}`, modelCatalog: catalog }] }
+    installPoolMock(({ sql }) => /FROM participants/.test(sql) ? { rows: [
+      { id: 'dynamic', name: 'Dynamic', engine, model: null, fastModel: null, ...computer },
+      { id: 'pinned', name: 'Pinned', engine, model: null, fastModel: null,
+        engineDefaults: { [engine]: { model: 'auto/pin', fastModel: 'auto/small' } }, ...computer },
+    ] } : { rows: [] })
+    const agents = await registry.listAgentsForComputer('comp-1')
+    assert.equal(agents[0]?.model, null, engine)
+    assert.equal(agents[0]?.fastModel, null, engine)
+    assert.equal(agents[1]?.model, 'auto/pin', engine)
+    assert.equal(agents[1]?.fastModel, 'auto/small', engine)
+  }
 })
 
 test('reportDetectedEngines keeps the previous default first when it is still installed', async () => {
