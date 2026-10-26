@@ -140,6 +140,11 @@ export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
     versionArgs: ['--version'],
     selfUpdate: 'maka update --target latest',
   },
+  omp: {
+    versionArgs: ['--version'],
+    npm: '@oh-my-pi/pi-coding-agent',
+    selfUpdate: 'omp update',
+  },
   hermes: {
     versionArgs: ['version'],
     selfUpdate: 'hermes update',

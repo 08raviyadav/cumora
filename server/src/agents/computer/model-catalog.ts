@@ -157,9 +157,24 @@ const PRESETS: Record<EngineId, EngineModelCatalog> = {
     fastModelScope: 'agent',
     source: 'presets',
   },
+  omp: {
+    // The namespace is the operator's own ~/.omp provider config, so there is
+    // no first-party preset to name — supportsCustom stays open for a pin.
+    models: [],
+    defaultModel: null,
+    defaultFastModel: null,
+    supportsCustom: true,
+    fastModelScope: 'agent',
+    source: 'presets',
+  },
 }
 
 const MODEL_PROBE_TIMEOUT_MS = 10_000
+// The first `omp models --json` of a fresh cache measured 11.9-13.5s here
+// (warm runs answer in 1.2s), so the shared 10s cap would report an empty
+// catalog on exactly the rescan after an install. Discovery rides the
+// 5-minute background rescan, so the longer ceiling costs nobody a wait.
+const OMP_CATALOG_TIMEOUT_MS = 30_000
 const MODEL_OUTPUT_LIMIT = 2 * 1024 * 1024
 const MODEL_CACHE_TTL_MS = 15 * 60 * 1000
 const catalogCache = new Map<string, {
@@ -231,7 +246,7 @@ function stopChild(child: ReturnType<typeof spawn>): void {
   child.once('close', () => clearTimeout(timer))
 }
 
-function runText(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<string | null> {
+function runText(command: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs = MODEL_PROBE_TIMEOUT_MS): Promise<string | null> {
   return new Promise((resolve) => {
     const invocation = versionCommandInvocation(command, args)
     let child: ReturnType<typeof spawn>
@@ -261,7 +276,7 @@ function runText(command: string, args: string[], env: NodeJS.ProcessEnv): Promi
       clearTimeout(timer)
       resolve(ok && !exceeded ? output.trim() : null)
     }
-    const timer = setTimeout(() => { stopChild(child); finish() }, MODEL_PROBE_TIMEOUT_MS)
+    const timer = setTimeout(() => { stopChild(child); finish() }, timeoutMs)
     timer.unref?.()
     child.once('error', () => finish())
     child.once('close', code => finish(code === 0))
@@ -343,6 +358,31 @@ export function parseListedModels(text: string, style: 'provider' | 'pi' | 'curs
   return mergeModels(models, [])
 }
 
+/** Parse `omp models --json`. The selectable id is `selector` (provider/name),
+ *  NOT the bare `id`, which is provider-relative and silently no-ops as a pin.
+ *  Exported so fixtures never need a real omp install. */
+export function parseOmpModels(text: string): EngineModelOption[] {
+  // A banner line ahead of the payload would otherwise parse as nothing and
+  // silently leave the picker on the empty preset.
+  const start = text.indexOf('{')
+  if (start < 0) return []
+  let payload: unknown
+  try { payload = JSON.parse(text.slice(start)) } catch { return [] }
+  if (!payload || typeof payload !== 'object' || !('models' in payload)) return []
+  if (!Array.isArray(payload.models)) return []
+  const models: EngineModelOption[] = []
+  for (const row of payload.models) {
+    if (!row || typeof row !== 'object') continue
+    if (!('kind' in row) || row.kind !== 'chat') continue
+    if (!('selector' in row) || typeof row.selector !== 'string') continue
+    const id = clean(row.selector, 160)
+    if (!id) continue
+    const label = 'name' in row && typeof row.name === 'string' ? row.name : null
+    models.push({ id, label: clean(label, 160) ?? id, description: null })
+  }
+  return mergeModels(models, [])
+}
+
 interface CodexListItem {
   id?: unknown
   model?: unknown
@@ -414,6 +454,10 @@ export async function discoverEngineModelCatalog(
     const output = await runText(binPath, [arg], env)
     const models = output === null ? [] : parseListedModels(output, style)
     return models.length || output === '' ? fromDiscovered(id, models, 'cli', null) : preset
+  }
+  if (id === 'omp') {
+    const models = parseOmpModels(await runText(binPath, ['models', '--json'], env, OMP_CATALOG_TIMEOUT_MS) ?? '')
+    return models.length ? fromDiscovered(id, models, 'cli', null) : preset
   }
   if (id === 'gemini' || id === 'qwen' || id === 'zcode') {
     try {

@@ -861,6 +861,9 @@ export function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'maka') {
     return 'Open Maka on that computer and run `maka` to refresh its login, model access, or quota, then wake the agent again.'
   }
+  if (engine === 'omp') {
+    return 'Open a terminal on that computer and run `omp` (or `omp login`) to refresh its provider credentials, then wake the agent again.'
+  }
   return 'Check the daemon terminal for details, then wake the agent again.'
 }
 
@@ -884,6 +887,7 @@ function missingEngineMessage(): string {
     '    (the daemon drives it through the npm-published `zcode-acp-server` bridge via npx;',
     '     CUMORA_ZCODE_ACP_BIN pins a specific bridge copy when needed)',
     '  - Maka: install the `maka` CLI, then run `maka` once to sign in',
+    '  - omp: install the `omp` CLI, then run `omp` once to sign in to a provider',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -2528,6 +2532,7 @@ export class AgentRunner {
     if (this.adapter.id === 'antigravity') return this.agent.model ?? 'gemini-3.8-flash-high'
     if (this.adapter.id === 'zcode') return this.agent.model ?? '<zcode-default>'
     if (this.adapter.id === 'maka') return '<maka-default>'
+    if (this.adapter.id === 'omp') return this.agent.model ?? '<omp-default>'
     if (this.adapter.id === 'cursor') return this.agent.model ?? '<cursor-default>'
     return this.agent.model ?? '<cursor-default>'
   }

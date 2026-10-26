@@ -322,10 +322,10 @@ const CODEX_LOG_RAW = process.env.CUMORA_CODEX_VERBOSE === '1'
  *  `shell:true` when nothing else is on PATH. */
 // Exported for tests; the nvm-windows extensionless-shim regression (issue #5)
 // needs a stable handle to the resolver without going through spawn().
-export function resolveSpawn(bin: string): { command: string; shell: boolean; wantsStdinPrompt: boolean } {
+export function resolveSpawn(bin: string, env: NodeJS.ProcessEnv = process.env): { command: string; shell: boolean; wantsStdinPrompt: boolean } {
   if (!IS_WIN) return { command: bin, shell: false, wantsStdinPrompt: false }
-  const exts = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.trim()).filter(Boolean)
-  for (const dir of (process.env.PATH ?? '').split(PATH_DELIMITER)) {
+  const exts = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.trim()).filter(Boolean)
+  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
     if (!dir) continue
     for (const ext of exts) {
       const candidate = join(dir, bin + ext)
@@ -342,7 +342,7 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   // itself is a `#!/bin/sh` wrapper and cannot be exec'd without a shell → force
   // shell:true so Node routes the call through cmd.exe, which can find the
   // .cmd via PATHEXT after the shim.
-  for (const dir of (process.env.PATH ?? '').split(PATH_DELIMITER)) {
+  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
     if (!dir) continue
     const shim = join(dir, bin)
     if (existsSync(shim)) {
@@ -394,10 +394,10 @@ export async function loginCodexRuntime(): Promise<void> {
   })
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode' | 'maka'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode' | 'maka' | 'omp'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity', 'zcode', 'maka']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity', 'zcode', 'maka', 'omp']
 
 /** Engines for which Cumora can impose a fail-closed filesystem + tool-network
  * boundary non-interactively. The remaining adapters still work for operators
@@ -2573,8 +2573,19 @@ type AcpMsg = {
   id?: number
   method?: string
   result?: { sessionId?: unknown }
-  error?: { message?: unknown }
+  // omp answers a real cause with a generic `Internal error` and puts the cause
+  // in `data.details` (e.g. "ACP session not found: <id>").
+  error?: { message?: unknown; data?: { details?: unknown } }
   params?: Record<string, unknown>
+}
+
+/** Operator-facing text for a JSON-RPC rejection. `data.details` carries the
+ *  actual cause on agents that answer every failure with a generic message;
+ *  appending it is additive, so adapters keyed on the plain message still match. */
+function acpErrorMessage(error: AcpMsg['error'], method: string): string {
+  const message = typeof error?.message === 'string' && error.message ? error.message : `${method} failed`
+  const details = error?.data?.details
+  return typeof details === 'string' && details.trim() ? `${message} — ${details}` : message
 }
 
 /** Persistent Grok Build session over ACP stdio (`grok agent --always-approve stdio`).
@@ -3135,7 +3146,7 @@ class AcpRpcConnection {
     const id = ++this.reqId
     return new Promise<AcpMsg>((resolve, reject) => {
       this.waiters.set(id, (msg) => {
-        if (msg.error) reject(new Error(String(msg.error.message || `${method} failed`)))
+        if (msg.error) reject(new Error(acpErrorMessage(msg.error, method)))
         else resolve(msg)
       })
       writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
@@ -3500,7 +3511,7 @@ function resolveMakaAcpSpawn(env: NodeJS.ProcessEnv): { command: string; args: s
   const explicit = env.CUMORA_MAKA_BIN?.trim()
   if (explicit) {
     if (/\.[cm]?js$/i.test(explicit)) return { command: process.execPath, args: [explicit, '--acp'], shell: false }
-    const sp = resolveSpawn(explicit)
+    const sp = resolveSpawn(explicit, env)
     return { command: sp.command, args: ['--acp'], shell: sp.shell }
   }
   const sp = resolveSpawn(resolveMakaBin(env) ?? 'maka')
@@ -3793,6 +3804,367 @@ class MakaAdapter implements EngineAdapter {
         ? 'aborted (timeout)'
         : err instanceof Error ? err.message : String(err)
       return { ok: false, detail: `maka acp handshake failed: ${why}`.slice(0, 240) }
+    } finally {
+      await session.stop({ force: true })
+    }
+  }
+}
+
+// ─── omp ──────────────────────────────────────────────────────────────────
+//
+// omp (the `omp` CLI, `omp acp`) is an ACP v1 agent server over stdio:
+// initialize → session/load (or session/new) → model pin → session/prompt per
+// wake. Triage rides the SAME lifecycle with `--no-tools --no-session`
+// appended — measured ~3.3s against `omp -p`'s 12–16s, and tool-free by
+// construction, one code path instead of a second parser. `omp acp` reads
+// AGENTS.md and .agents/skills from the session cwd natively; its
+// `--append-system-prompt` is NOT delivered over ACP, so
+// carriesStandingPrompt stays false and the daemon inlines the standing
+// prompt per wake (the Cursor/OpenCode contract).
+
+/** Resolve `CUMORA_OMP_BIN` or `omp` on `env.PATH`. */
+export function resolveOmpBin(env: NodeJS.ProcessEnv = process.env): string | null {
+  const explicit = env.CUMORA_OMP_BIN?.trim()
+  if (explicit) return explicit
+  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
+    if (!dir) continue
+    const candidate = join(dir, IS_WIN ? 'omp.cmd' : 'omp')
+    if (existsSync(candidate)) return candidate
+    if (IS_WIN && existsSync(join(dir, 'omp.exe'))) return join(dir, 'omp.exe')
+    if (IS_WIN && existsSync(join(dir, 'omp'))) return join(dir, 'omp')
+  }
+  return null
+}
+
+/** Locate the `omp acp` spawn command. `extraArgs` is what separates a wake
+ *  (full tools) from triage (`--no-tools --no-session`). */
+function resolveOmpAcpSpawn(env: NodeJS.ProcessEnv, extraArgs: string[]): { command: string; args: string[]; shell: boolean } {
+  const explicit = env.CUMORA_OMP_BIN?.trim()
+  if (explicit) {
+    if (/\.[cm]?js$/i.test(explicit)) return { command: process.execPath, args: [explicit, 'acp', ...extraArgs], shell: false }
+    const sp = resolveSpawn(explicit, env)
+    return { command: sp.command, args: ['acp', ...extraArgs], shell: sp.shell }
+  }
+  const sp = resolveSpawn(resolveOmpBin(env) ?? 'omp', env)
+  return { command: sp.command, args: ['acp', ...extraArgs], shell: sp.shell }
+}
+
+interface OmpTurnOptions {
+  cwd: string
+  env: NodeJS.ProcessEnv
+  prompt: string
+  model?: string | null
+  resumeSessionId?: string | null
+  signal: AbortSignal
+  onLog?: (line: string) => void
+  onHopUsage?: (r: EngineHopReport) => void
+  /** Stateless triage surface: `--no-tools --no-session`. */
+  noTools?: boolean
+}
+
+interface OmpSessionOptions extends EngineSessionArgs {
+  onAgentText?: (text: string) => void
+  signal?: AbortSignal
+  extraArgs?: string[]
+}
+
+/** omp names one failure two ways: `ACP session not found: <id>` when the
+ *  attach misses, `Unsupported ACP session: <id>` from a live call on an id
+ *  the engine no longer holds. Both ride `error.data.details`, which
+ *  acpErrorMessage() surfaces into the classifier's input. */
+const OMP_MISSING_SESSION_RE = /acp session not found|unsupported acp session/i
+
+class OmpSession implements EngineSession {
+  readonly carriesStandingPrompt = false
+
+  private readonly conn: AcpRpcConnection
+  private readonly onLog: (line: string) => void
+  private readonly onHopUsage?: (r: EngineHopReport) => void
+  private readonly onAgentText?: (text: string) => void
+  private readonly model: string | null
+  private modelPinTried = false
+  private modelPinAccepted = false
+  private turn: { resolve: (r: EngineRunResult) => void } | null = null
+  private promptInFlight = false
+  private steerWarned = false
+  private stopped = false
+
+  constructor(home: string, env: NodeJS.ProcessEnv, opts: OmpSessionOptions) {
+    this.onLog = opts.onLog
+    this.onHopUsage = opts.onHopUsage
+    this.onAgentText = opts.onAgentText
+    this.model = opts.model ?? null
+    this.conn = new AcpRpcConnection(
+      resolveOmpAcpSpawn(env, opts.extraArgs ?? []),
+      home,
+      env,
+      opts.resumeSessionId ?? null,
+      () => ({ cwd: home, mcpServers: [] }),
+      {
+        onLog: (line) => this.onLog(line),
+        onNotification: (msg) => this.onUpdate(msg),
+        onDeath: (code, why) => this.onDeath(code, why),
+        onLoadFallback: (why) => {
+          this.onLog(`[omp] session/load failed (${why}) — starting a fresh session`)
+        },
+      },
+      opts.signal,
+      'session/load',
+    )
+  }
+
+  get alive(): boolean { return this.conn.alive }
+  get sessionId(): string | null { return this.conn.sid }
+  whenReady(): Promise<void> { return this.conn.ready }
+
+  async send(prompt: string): Promise<EngineRunResult> {
+    if (this.turn) return classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.conn.sid }, this.conn.resumed)
+    if (!this.alive) return classifyEngineResult({ exitCode: this.conn.exitStatusCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.conn.sid }, this.conn.resumed)
+    let resolveTurn!: (r: EngineRunResult) => void
+    const done = new Promise<EngineRunResult>((resolve) => { resolveTurn = resolve })
+    let settled = false
+    const settle = (r: EngineRunResult) => { if (!settled) { settled = true; this.turn = null; resolveTurn(r) } }
+    this.turn = { resolve: settle }
+    try {
+      await this.conn.ready
+      await this.applyModelPin()
+      if (!this.alive) throw new Error('engine session is not alive (process gone)')
+      const wasResume = this.conn.resumed
+      const startedAt = Date.now()
+      this.promptInFlight = true
+      const resp = await this.conn.rpc('session/prompt', {
+        sessionId: this.conn.sid,
+        prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
+      })
+      this.conn.resumed = false
+      const stopReason = (resp.result as { stopReason?: unknown } | undefined)?.stopReason
+      if (stopReason === 'cancelled') {
+        settle(this.failureResult('omp turn was cancelled', wasResume, 1))
+        return done
+      }
+      const usage = extractAcpUsage(resp.result) ?? undefined
+      const model = this.model && this.modelPinAccepted ? this.model : '<omp-default>'
+      if (this.onHopUsage) {
+        try {
+          this.onHopUsage({
+            model,
+            usage,
+            latencyMs: Date.now() - startedAt,
+            hopIndex: 1,
+          })
+        } catch { /* never break the stream */ }
+      }
+      settle(classifyEngineResult({ exitCode: 0, sessionId: this.conn.sid, usage, model }, wasResume))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const wasResume = this.conn.resumed
+      this.conn.resumed = false
+      settle(this.failureResult(message, wasResume, this.conn.exitStatusCode || 1))
+    } finally {
+      this.promptInFlight = false
+    }
+    return done
+  }
+
+  steer(text: string): void {
+    // Idle means nothing to inject into: omp answers `{outcome:'promptRequired'}`,
+    // and the daemon's next wake already carries the ping.
+    if (!this.promptInFlight || !this.conn.sid) return
+    void this.conn.rpc('_session/steering', {
+      sessionId: this.conn.sid,
+      prompt: [{ type: 'text', text: stripLoneSurrogates(text) }],
+      _meta: { steering: { queue: 'steering' } },
+    }).catch((err: unknown) => {
+      // Steering is an optional extension: an older omp rejects the method, and
+      // an inject that loses the race to the turn's end changes nothing. Either
+      // way the coalesced rerun is the backstop, so warn once and stop shouting.
+      if (this.steerWarned) return
+      this.steerWarned = true
+      this.log(`[omp] steer rejected (${err instanceof Error ? err.message : String(err)}) — the ping rides the next wake`)
+    })
+  }
+
+  async stop(options: { force?: boolean } = {}): Promise<void> {
+    this.stopped = true
+    await this.conn.stop(options)
+  }
+
+  /** ONE attempt per session process. A rejection is a preference loss, not a
+   *  turn failure: omp answers an unknown selector with `Unknown ACP model` and
+   *  the following prompt still runs on the engine default. */
+  private async applyModelPin(): Promise<void> {
+    if (this.modelPinTried || !this.model || !this.conn.sid) return
+    this.modelPinTried = true
+    try {
+      await this.conn.rpc('session/set_config_option', { sessionId: this.conn.sid, configId: 'model', value: this.model })
+      this.modelPinAccepted = true
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err)
+      this.log(`[omp] model pin (${this.model}) rejected (${why}) — continuing on the engine default`)
+    }
+  }
+
+  private failureResult(message: string, wasResume: boolean, exitCode = 1): EngineRunResult {
+    // omp's wording is unambiguous, so it classifies whether or not this turn
+    // began as a resume: a session can also disappear AFTER a successful turn,
+    // and gating on `resumed` would leave the connection on a stale id.
+    const missingSession = OMP_MISSING_SESSION_RE.test(message)
+    return classifyEngineResult({
+      exitCode,
+      error: message,
+      failure: missingSession
+        ? { kind: 'resume-not-found', message, diagnostic: message }
+        : undefined,
+      sessionId: this.conn.sid,
+    }, wasResume)
+  }
+
+  private onDeath(code: number, why: string): void {
+    if (!this.stopped) {
+      this.log(`[session] engine process died ${this.turn ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
+    }
+    const wasResume = this.conn.resumed
+    this.conn.resumed = false
+    this.turn?.resolve(this.failureResult(why, wasResume, code))
+  }
+
+  private onUpdate(msg: AcpMsg): void {
+    if (msg.method === 'session/request_permission' && msg.id !== undefined) {
+      const options = Array.isArray(msg.params?.options)
+        ? msg.params.options as Array<{ optionId?: unknown; kind?: unknown }>
+        : []
+      const preferred = options.find((o) => o?.kind === 'allow_always')
+        ?? options.find((o) => o?.kind === 'allow_once')
+      if (typeof preferred?.optionId === 'string' && preferred.optionId) {
+        this.conn.reply(msg.id, { outcome: { outcome: 'selected', optionId: preferred.optionId } })
+      } else {
+        this.conn.reply(msg.id, { outcome: { outcome: 'cancelled' } })
+      }
+      return
+    }
+    // A session/load replays the prior transcript as agent_message_chunk
+    // notifications; only chunks of the turn we asked for are the turn's text.
+    if (msg.method !== 'session/update' || !this.promptInFlight) return
+    const u = (msg.params?.update ?? msg.params) as Record<string, unknown> | undefined
+    const kind = typeof u?.sessionUpdate === 'string' ? u.sessionUpdate : null
+    if (kind === 'tool_call' && typeof u?.title === 'string') {
+      this.log(`[omp] tool ${u.title}`)
+    } else if (kind === 'agent_message_chunk') {
+      const content = u?.content as { text?: unknown } | undefined
+      if (typeof content?.text === 'string' && content.text) {
+        this.onAgentText?.(content.text)
+        if (content.text.trim()) this.log(`[omp] » ${content.text.replace(/\s+/g, ' ').slice(0, 200)}`)
+      }
+    }
+  }
+
+  private log(line: string): void { this.onLog(line) }
+}
+
+/** One full omp lifecycle for the stateless paths (run/classify/probe): a fresh
+ *  `omp acp`, one turn, tear-down. A missing binary or a rejected handshake is a
+ *  failed TURN, not a thrown one, so callers keep their uniform error handling. */
+async function runOmpAcpTurn(opts: OmpTurnOptions): Promise<EngineRunResult & { text: string }> {
+  const chunks: string[] = []
+  const session = new OmpSession(opts.cwd, opts.env, {
+    home: opts.cwd,
+    env: opts.env,
+    model: opts.model,
+    standingPrompt: null,
+    resumeSessionId: opts.resumeSessionId ?? null,
+    onLog: opts.onLog ?? (() => {}),
+    onHopUsage: opts.onHopUsage,
+    onAgentText: (text) => chunks.push(text),
+    signal: opts.signal,
+    // `omp acp` persists a transcript even with `--no-session`, so triage leaves
+    // one behind per call. It stays in omp's own store on purpose: `omp gc`
+    // prunes that directory (retain-newest-per-cwd), and pointing --session-dir
+    // at a Cumora path would move the files out of reach of that sweep.
+    extraArgs: opts.noTools ? ['--no-tools', '--no-session'] : [],
+  })
+  try {
+    return { ...await session.send(opts.prompt), text: chunks.join('') }
+  } finally {
+    await session.stop({ force: true })
+  }
+}
+
+class OmpAdapter implements EngineAdapter {
+  readonly id = 'omp' as const
+  readonly bin = 'omp'
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    // omp discovers project skills under .agents/skills/ in the session cwd and
+    // reads AGENTS.md from it — both measured against 18.12.6.
+    await mkdir(join(home, '.agents', 'skills'), { recursive: true })
+    await atomicAgentWrite(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.agents/skills/' }),
+    )
+  }
+
+  run(args: EngineRunArgs): Promise<EngineRunResult> {
+    // Full tools: permissions raised mid-turn are auto-answered by OmpSession.
+    return runOmpAcpTurn({
+      cwd: args.home,
+      env: args.env,
+      prompt: args.prompt,
+      model: args.model,
+      resumeSessionId: args.resumeSessionId,
+      signal: args.signal,
+      onLog: args.onLog,
+      onHopUsage: args.onHopUsage,
+    })
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession | null {
+    return new OmpSession(args.home, args.env, args)
+  }
+
+  classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    return runOmpAcpTurn({
+      cwd: args.cwd,
+      env: args.env,
+      prompt: args.prompt,
+      model: args.model,
+      signal: args.signal,
+      onLog: args.onLog,
+      noTools: true,
+    })
+  }
+
+  probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    // Both tiers run the engine default: the catalog is the operator's own
+    // omp provider config, so there is no first-party cheap alias to pin.
+    return runOmpAcpTurn({
+      cwd: args.cwd,
+      env: args.env,
+      prompt: DOCTOR_PROMPT,
+      signal: args.signal,
+      noTools: true,
+    })
+  }
+
+  async probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // The wake path IS `omp acp` on every platform (JSON-RPC over the Windows
+    // .cmd shim works), so this probe is never skipped.
+    const session = new OmpSession(args.cwd, args.env, {
+      home: args.cwd,
+      env: args.env,
+      standingPrompt: null,
+      resumeSessionId: null,
+      onLog: () => {},
+      signal: args.signal,
+    })
+    try {
+      await session.whenReady()
+      return { ok: true, detail: '' }
+    } catch (err) {
+      const why = args.signal.aborted
+        ? 'aborted (timeout)'
+        : err instanceof Error ? err.message : String(err)
+      return { ok: false, detail: `omp acp handshake failed: ${why}`.slice(0, 240) }
     } finally {
       await session.stop({ force: true })
     }
@@ -6302,6 +6674,7 @@ const ADAPTERS: Record<EngineId, EngineAdapter> = {
   antigravity: new AntigravityAdapter(),
   zcode: new ZcodeAdapter(),
   maka: new MakaAdapter(),
+  omp: new OmpAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {
@@ -6324,6 +6697,7 @@ export async function detectEnginesWithStatus(): Promise<EngineDetection> {
     const installed = status === 'present'
       || (id === 'grok' && resolveGrokBin() != null)
       || (id === 'maka' && resolveMakaBin() != null)
+      || (id === 'omp' && resolveOmpBin() != null)
     return { id, installed, status }
   }))
   return {
@@ -6368,7 +6742,9 @@ export async function snapshotDetectedEngines(ids?: readonly EngineId[]): Promis
       ? (resolveGrokBin() ?? await resolveBinPath(bin))
       : id === 'maka'
         ? (resolveMakaBin() ?? await resolveBinPath(bin))
-        : await resolveBinPath(bin)
+        : id === 'omp'
+          ? (resolveOmpBin() ?? await resolveBinPath(bin))
+          : await resolveBinPath(bin)
     return { id, bin, path }
   }))
 }
@@ -6497,7 +6873,10 @@ export async function runEngineDoctor(opts?: {
   return Promise.all(ids.map(async (id): Promise<EngineHealth> => {
     const adapter = ADAPTERS[id]
     const path = (await resolveBinPath(adapter.bin))
-      ?? (id === 'grok' ? resolveGrokBin(env) : id === 'maka' ? resolveMakaBin(env) : null)
+      ?? (id === 'grok' ? resolveGrokBin(env)
+        : id === 'maka' ? resolveMakaBin(env)
+        : id === 'omp' ? resolveOmpBin(env)
+        : null)
     if (!path) return { id, installed: false, path: null, big: null, small: null, wake: null }
     const probeTier = async (tier: 'big' | 'small'): Promise<BrainHealth> => {
       const controller = new AbortController()

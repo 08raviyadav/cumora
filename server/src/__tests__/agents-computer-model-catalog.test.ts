@@ -9,7 +9,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readClaudeUserSettings, withClaudeUserSettingsEnv } from '../agents/computer/claude-user-settings.js'
-import { clearModelCatalogCache, discoverEngineModelCatalog, parseListedModels } from '../agents/computer/model-catalog.js'
+import { clearModelCatalogCache, discoverEngineModelCatalog, parseListedModels, parseOmpModels } from '../agents/computer/model-catalog.js'
 
 // Metadata probes must never share the developer's real Codex home/login.
 const isolatedHome = await mkdtemp(join(tmpdir(), 'cumora-catalog-home-'))
@@ -334,5 +334,65 @@ test('an engine with a preset keeps it when its CLI fails to list', async () => 
   } finally {
     clearModelCatalogCache()
     await cleanup()
+  }
+})
+
+/** Cross-platform omp stand-in: the binary prints `payload` whatever the argv,
+ *  which is all discovery reads. */
+async function stubOmpListing(payload: string): Promise<{ bin: string; cleanup: () => Promise<void> }> {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-omp-listing-'))
+  const script = join(root, 'models.mjs')
+  const bin = join(root, process.platform === 'win32' ? 'omp.cmd' : 'omp')
+  await writeFile(script, `process.stdout.write(${JSON.stringify(payload)})\n`)
+  await writeFile(bin, process.platform === 'win32'
+    ? `@echo off\r\n"${process.execPath}" "%~dp0models.mjs" %*\r\n`
+    : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`, { mode: 0o755 })
+  return { bin, cleanup: () => rm(root, { recursive: true, force: true }) }
+}
+
+test('omp catalog keys rows on the provider-qualified selector and drops non-chat entries', async () => {
+  // The bare `id` is provider-relative; pinning it silently no-ops, so a parser
+  // that takes `id` would produce a picker whose every choice does nothing.
+  const payload = JSON.stringify({
+    models: [
+      { provider: 'magpie', kind: 'chat', id: 'auto/dfmodel', selector: 'magpie/auto/dfmodel', name: 'magpie/auto/dfmodel' },
+      { provider: 'deepseek', kind: 'chat', id: 'deepseek-v4-flash', selector: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+      { provider: 'openai', kind: 'embedding', id: 'embed', selector: 'openai/embed', name: 'Embeddings' },
+      { provider: 'deepseek', kind: 'chat', id: 'deepseek-v4-flash', selector: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+    ],
+  })
+  assert.deepEqual(parseOmpModels(payload), [
+    { id: 'magpie/auto/dfmodel', label: 'magpie/auto/dfmodel', description: null, recommendedFor: undefined },
+    { id: 'deepseek/deepseek-v4-flash', label: 'DeepSeek V4 Flash', description: null, recommendedFor: undefined },
+  ])
+
+  const { bin, cleanup } = await stubOmpListing(payload)
+  try {
+    clearModelCatalogCache()
+    const catalog = await discoverEngineModelCatalog('omp', bin, true)
+    assert.equal(catalog.source, 'cli')
+    assert.equal(catalog.trustedModels, true)
+    assert.equal(catalog.supportsCustom, true)
+    assert.equal(catalog.fastModelScope, 'agent')
+    assert.deepEqual(catalog.models.map((model) => model.id), ['magpie/auto/dfmodel', 'deepseek/deepseek-v4-flash'])
+  } finally {
+    clearModelCatalogCache()
+    await cleanup()
+  }
+})
+
+test('omp discovery falls back to its preset on an empty or non-JSON listing', async () => {
+  for (const payload of ['{"models":[]}', 'not json at all', '']) {
+    const { bin, cleanup } = await stubOmpListing(payload)
+    try {
+      clearModelCatalogCache()
+      const catalog = await discoverEngineModelCatalog('omp', bin, true)
+      assert.equal(catalog.source, 'presets', payload)
+      assert.deepEqual(catalog.models, [], payload)
+      assert.equal(catalog.trustedModels, undefined, payload)
+    } finally {
+      clearModelCatalogCache()
+      await cleanup()
+    }
   }
 })

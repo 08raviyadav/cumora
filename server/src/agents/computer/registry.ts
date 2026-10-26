@@ -26,7 +26,7 @@ import { signAgentToken } from '../runtime/jwt.js'
 import type { EngineModelCatalog, EngineModelOption, FastModelScope, ModelCatalogSource } from './model-catalog.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode' | 'maka'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode' | 'maka' | 'omp'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -71,6 +71,7 @@ const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
   antigravity: true,
   zcode: true,
   maka: true,
+  omp: true,
 }
 export const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
 
@@ -124,6 +125,7 @@ const ENGINE_BINS: Record<Exclude<EngineId, 'managed'>, string> = {
   antigravity: 'agy',
   zcode: 'zcode',
   maka: 'maka',
+  omp: 'omp',
 }
 
 /** Cached PATH snapshot from the daemon. The app reads this; it never probes. */
@@ -793,6 +795,9 @@ export async function listAgentsForComputer(computerId: string, supportsProvider
   const qwenDefault = process.env.CUMORA_DEFAULT_QWEN_MODEL?.trim() || null
   const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
   const zcodeDefault = process.env.CUMORA_DEFAULT_ZCODE_MODEL?.trim() || null
+  // omp's catalog is whatever providers the operator's own ~/.omp/agent config
+  // reaches, so there is no universal default to name — only a deploy pin.
+  const ompDefault = process.env.CUMORA_DEFAULT_OMP_MODEL?.trim() || null
   return rows.map((r) => {
     const { availableEngines, detectedEngines, engineDefaults, ...agent } = r
     // A profile's endpoint owns its model namespace: neither the computer's
@@ -842,7 +847,9 @@ export async function listAgentsForComputer(computerId: string, supportsProvider
                         ? zcodeDefault
                         : r.engine === 'maka'
                           ? null
-                          : null
+                          : r.engine === 'omp'
+                            ? ompDefault
+                            : null
     return dflt ? { ...agent, model: dflt, fastModel: fastModelWithEngineDefault } : { ...agent, fastModel: fastModelWithEngineDefault }
   })
 }

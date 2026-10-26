@@ -1,4 +1,4 @@
-# BYOA — Bring Your Own Agent (local Claude Code / Codex / Grok Build / Cursor Agent / OpenCode / pi / Gemini CLI / Qwen Code / Antigravity / ZCode as the engine)
+# BYOA — Bring Your Own Agent (local Claude Code / Codex / Grok Build / Cursor Agent / OpenCode / pi / Gemini CLI / Qwen Code / Antigravity / ZCode / omp as the engine)
 
 Every Cumora agent has a "brain" and a host. The managed path is
 server-side: `runAgentTurn` in `server/src/agents/turn.ts` runs a
@@ -8,7 +8,7 @@ a per-agent Kubernetes pod (the `agent-computer` image).
 **BYOA** lets a user supply the brain instead: a long-running daemon on
 the user's own machine (laptop **or** VPS) drives a local **Claude Code**,
 **Codex CLI**, **Grok Build** (`grok`), **Cursor Agent** (`cursor-agent`),
-**OpenCode** (`opencode`), **pi** (`pi`), **Gemini CLI** (`gemini`), **Qwen Code** (`qwen`), **Antigravity** (`agy`), or **ZCode** (`zcode`, driven through the `zcode-acp-server` ACP bridge) as the reasoning engine, on the user's own provider
+**OpenCode** (`opencode`), **pi** (`pi`), **Gemini CLI** (`gemini`), **Qwen Code** (`qwen`), **Antigravity** (`agy`), **ZCode** (`zcode`, driven through the `zcode-acp-server` ACP bridge), or **omp** (`omp acp`) as the reasoning engine, on the user's own provider
 account — the server never holds the user's provider credentials.
 One daemon hosts **many independent agents** — each with its own dedicated
 home directory, memory, skills, and notes. In Cumora these still appear
@@ -149,6 +149,7 @@ Discovery covers backend vendors through the engine that uses them:
 | Qwen | User `settings.json` declarations for the active auth protocol; `QWEN_HOME` is honored |
 | ZCode | Enabled providers in `v2/config.json` and desktop `v2/provider_config.json`; `ZCODE_HOME` and `ZCODE_PROVIDER` are honored |
 | Maka | The current ACP adapter does not expose model selection |
+| omp | Native `omp models --json` (selector ids) |
 
 Native CLI commands resolve their own provider configuration and are re-read on
 each rescan, with the daemon environment and a neutral working directory.
@@ -353,7 +354,7 @@ from their own agenda — Kanban cards and due calendar slots — via
 ## Engine integration
 
 `server/src/agents/computer/engine.ts` defines one `EngineAdapter` per
-engine (`claude`, `codex`, `grok`, `cursor`, `opencode`, `pi`, `gemini`, `qwen`, `antigravity`, `zcode`). Persistent per-agent
+engine (`claude`, `codex`, `grok`, `cursor`, `opencode`, `pi`, `gemini`, `qwen`, `antigravity`, `zcode`, `maka`, `omp`). Persistent per-agent
 sessions are preferred when the CLI exposes one; Cursor and OpenCode use
 one-shot `run()` for every wake and resume the session id reported by the CLI.
 
@@ -374,16 +375,16 @@ interface EngineSession {
 }
 ```
 
-| Concern | Claude Code | Codex CLI | Grok Build | Cursor Agent | OpenCode | pi | Gemini CLI | Qwen Code | Antigravity | ZCode |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Secure default | Claude Code ≥ 2.1.248 with `--restricted` and sandboxed Bash; PowerShell/web tools, host-home reads, command network, unsandboxed retry, and subprocess credentials are denied | Codex ≥ 0.138.0 with a custom permission profile: only minimal runtime reads plus the agent home; command network disabled; tool env allowlisted; user/project config, rules, hooks, apps, remote plugins, and multi-agent tools ignored or disabled | disabled | disabled | disabled | disabled | disabled | disabled | disabled | disabled |
-| Platform | macOS, Linux, WSL2; native Windows disabled because Claude's sandbox is unsupported there | macOS, Linux, WSL2, native Windows | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only |
-| Persistent session | secure default; `claude -p --input-format stream-json --output-format stream-json --verbose` | compatibility opt-in only; secure default uses one-shot `exec` | compatibility opt-in ACP | none | none | compatibility opt-in RPC | none | none — 0.22.3 has no stream-json INPUT mode | compatibility bidirectional stream-json | compatibility ACP via the `zcode-acp-server` bridge |
-| Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | inlined into each secure one-shot wake | compatibility ACP `_meta.rules` | inlined | inlined | compatibility `--append-system-prompt` | inlined | inlined | inlined | inlined |
-| One-shot | sandboxed `claude -p … --output-format stream-json` | sandboxed `codex exec --ignore-user-config --ignore-rules …` | compatibility `grok -p … --always-approve` | compatibility `cursor-agent … --force --trust` | compatibility `opencode run … --auto` | compatibility `pi … -p` | compatibility `gemini … --yolo` | compatibility `qwen --output-format stream-json --yolo` | same stream-json protocol for one turn | one fresh bridge process per turn (ACP `session/prompt`) |
-| Custom argv | ignored securely; requires the compatibility opt-in | ignored securely; requires the compatibility opt-in | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | not supported initially | not supported — `CUMORA_ZCODE_ACP_BIN` picks the bridge entry, never engine argv |
-| Memory / persona file | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` plus `.opencode/skills/` | `AGENTS.md` plus `.pi/skills/` (loaded via `--skill`) | `GEMINI.md` plus `.gemini/skills/` | `QWEN.md` plus `.qwen/skills/` | `AGENTS.md` plus `.agents/skills/` | `AGENTS.md` plus `.agents/skills/` |
-| Triage (small brain) | restricted and tool-free | read-only custom profile and tool env | compatibility only | compatibility only | compatibility only | compatibility only | compatibility only | compatibility only | plan mode inside `agy --sandbox` | one fresh bridge process in the neutral triage cwd |
+| Concern | Claude Code | Codex CLI | Grok Build | Cursor Agent | OpenCode | pi | Gemini CLI | Qwen Code | Antigravity | ZCode | omp |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Secure default | Claude Code ≥ 2.1.248 with `--restricted` and sandboxed Bash; PowerShell/web tools, host-home reads, command network, unsandboxed retry, and subprocess credentials are denied | Codex ≥ 0.138.0 with a custom permission profile: only minimal runtime reads plus the agent home; command network disabled; tool env allowlisted; user/project config, rules, hooks, apps, remote plugins, and multi-agent tools ignored or disabled | disabled | disabled | disabled | disabled | disabled | disabled | disabled | disabled | disabled |
+| Platform | macOS, Linux, WSL2; native Windows disabled because Claude's sandbox is unsupported there | macOS, Linux, WSL2, native Windows | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only | compatibility opt-in only |
+| Persistent session | secure default; `claude -p --input-format stream-json --output-format stream-json --verbose` | compatibility opt-in only; secure default uses one-shot `exec` | compatibility opt-in ACP | none | none | compatibility opt-in RPC | none | none — 0.22.3 has no stream-json INPUT mode | compatibility bidirectional stream-json | compatibility ACP via the `zcode-acp-server` bridge | compatibility ACP (`omp acp`) |
+| Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | inlined into each secure one-shot wake | compatibility ACP `_meta.rules` | inlined | inlined | compatibility `--append-system-prompt` | inlined | inlined | inlined | inlined | inlined |
+| One-shot | sandboxed `claude -p … --output-format stream-json` | sandboxed `codex exec --ignore-user-config --ignore-rules …` | compatibility `grok -p … --always-approve` | compatibility `cursor-agent … --force --trust` | compatibility `opencode run … --auto` | compatibility `pi … -p` | compatibility `gemini … --yolo` | compatibility `qwen --output-format stream-json --yolo` | same stream-json protocol for one turn | one fresh bridge process per turn (ACP `session/prompt`) | one fresh `omp acp` process per turn (full tools) |
+| Custom argv | ignored securely; requires the compatibility opt-in | ignored securely; requires the compatibility opt-in | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | not supported initially | not supported — `CUMORA_ZCODE_ACP_BIN` picks the bridge entry, never engine argv | not supported — `CUMORA_OMP_BIN` picks the entry, never engine argv |
+| Memory / persona file | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` plus `.opencode/skills/` | `AGENTS.md` plus `.pi/skills/` (loaded via `--skill`) | `GEMINI.md` plus `.gemini/skills/` | `QWEN.md` plus `.qwen/skills/` | `AGENTS.md` plus `.agents/skills/` | `AGENTS.md` plus `.agents/skills/` | `AGENTS.md` plus `.agents/skills/` |
+| Triage (small brain) | restricted and tool-free | read-only custom profile and tool env | compatibility only | compatibility only | compatibility only | compatibility only | compatibility only | compatibility only | plan mode inside `agy --sandbox` | one fresh bridge process in the neutral triage cwd | ACP no-tools: `omp acp --no-tools --no-session` |
 
 Sessions carry a resume id (`~/.cumora/sessions/<agentId>.session`); a
 failed resume falls back to a fresh thread instead of wedging the agent.
