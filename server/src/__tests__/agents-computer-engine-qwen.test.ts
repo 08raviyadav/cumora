@@ -232,7 +232,7 @@ test('non-JSON noise and truncated lines are ignored', () => {
 
 // ── triage ──────────────────────────────────────────────────────────────────
 
-test('triage runs safe-mode on the cheap model and gets the text back', { skip: IS_WIN }, async () => {
+test('triage runs safe-mode and plan mode on the cheap model', { skip: IS_WIN }, async () => {
   const f = await fixture()
   const res = await getAdapter('qwen').classify({ cwd: f.home, prompt: 'classify this', env: f.env, ...noop })
   assert.equal(res.text, 'echo:classify this')
@@ -240,10 +240,10 @@ test('triage runs safe-mode on the cheap model and gets the text back', { skip: 
 
   const [call] = await fakeLog(f)
   // --safe-mode leaves context files, hooks, extensions, skills and MCP
-  // servers unloaded; --yolo is an argv flag and still wins over it, so
-  // nothing can stall on an approval nobody is there to give.
+  // servers unloaded; plan mode removes automatic tool approval.
   assert.ok(call.argv.includes('--safe-mode'))
-  assert.ok(call.argv.includes('--yolo'))
+  assert.deepEqual(call.argv.slice(call.argv.indexOf('--approval-mode'), call.argv.indexOf('--approval-mode') + 2), ['--approval-mode', 'plan'])
+  assert.equal(call.argv.includes('--yolo'), false)
   assert.equal(call.argv[call.argv.indexOf('--model') + 1], 'qwen3-coder-flash')
 })
 

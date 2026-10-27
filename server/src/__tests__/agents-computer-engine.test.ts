@@ -588,6 +588,9 @@ else { process.stdin.resume(); process.stdin.on('end', reply) }
     const env = secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir })
     const triage = await getAdapter('claude').classify({ cwd: home, env, model: 'haiku', prompt: 'classify', signal: new AbortController().signal })
     assert.equal(JSON.parse(triage.text).disabled, '1')
+    const triageArgv = JSON.parse(triage.text).argv as string[]
+    assert.equal(triageArgv[triageArgv.indexOf('--tools') + 1], '')
+    assert.equal(triageArgv.includes('--dangerously-skip-permissions'), false)
     const doctor = await getAdapter('claude').probe({ cwd: home, env, tier: 'small', signal: new AbortController().signal })
     assert.equal(JSON.parse(doctor.text).disabled, '1')
   }

@@ -327,6 +327,22 @@ test('concurrent triage shares one cwd cleanly and leaves no staging files', { s
   assert.deepEqual(stray, [], 'a rename was skipped and left a staging file behind')
 })
 
+test('triage fails closed when its tool-free settings cannot be installed', { skip: IS_WIN }, async () => {
+  const f = await fixture()
+  await mkdir(join(f.home, '.cumora-gemini-triage.json'))
+  const res = await getAdapter('gemini').classify({
+    cwd: f.home, prompt: 'x', env: f.env, ...noop,
+  })
+  assert.notEqual(res.error, undefined)
+  assert.match(res.error ?? '', /could not install Gemini triage settings/)
+  assert.deepEqual(await fakeLog(f), [])
+  assert.deepEqual(
+    (await readdir(f.home)).filter((name) =>
+      name.startsWith('.cumora-gemini-triage.') && name !== '.cumora-gemini-triage.json'),
+    [],
+  )
+})
+
 test('CUMORA_TRIAGE_MODEL overrides the triage model', { skip: IS_WIN }, async () => {
   process.env.CUMORA_TRIAGE_MODEL = 'gemini-2.5-flash'
   const f = await fixture()

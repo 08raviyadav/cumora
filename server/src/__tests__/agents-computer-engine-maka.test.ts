@@ -90,7 +90,9 @@ rl.on('line', (line) => {
       send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: msg.params.sessionId, configOptions: [] } })
     }
   } else if (msg.method === 'session/set_config_option') {
-    if (msg.params?.configId !== 'permission_mode' || !['ask', 'bypass'].includes(msg.params?.value)) {
+    if (mode === 'reject-ask' && msg.params?.value === 'ask') {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'permission mode is unavailable' } })
+    } else if (msg.params?.configId !== 'permission_mode' || !['ask', 'bypass'].includes(msg.params?.value)) {
       send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'Invalid params: Invalid Session configuration option' } })
     } else {
       send({ jsonrpc: '2.0', id: msg.id, result: { configOptions: [] } })
@@ -466,7 +468,7 @@ test('maka process dying MID-TURN resolves the turn as a failure, never rejects'
   assert.equal(session.alive, false)
 })
 
-test('maka seedHome writes AGENTS.md and .agents/skills, and classify/probe use bypass mode', async () => {
+test('maka seedHome writes AGENTS.md and .agents/skills, and classify uses ask mode', async () => {
   const f = await makeFixture()
   const adapter = getAdapter('maka')
   await adapter.seedHome(f.home, {
@@ -492,7 +494,37 @@ test('maka seedHome writes AGENTS.md and .agents/skills, and classify/probe use 
 
   const calls = await f.readCalls()
   const permCfg = calls.find((c) => c.method === 'session/set_config_option' && c.params?.configId === 'permission_mode')
-  assert.equal(permCfg?.params?.value, 'bypass')
+  assert.equal(permCfg?.params?.value, 'ask')
+})
+
+test('maka triage cancels permission requests instead of approving them', async () => {
+  const f = await makeFixture('ask-permission')
+  const classified = await getAdapter('maka').classify({
+    cwd: f.home,
+    env: f.env,
+    prompt: 'classify without tools',
+    signal: new AbortController().signal,
+  })
+  assert.equal(classified.error, undefined)
+  const calls = await f.readCalls()
+  const permCfg = calls.find((c) => c.method === 'session/set_config_option' && c.params?.configId === 'permission_mode')
+  assert.equal(permCfg?.params?.value, 'ask')
+  const promptCall = calls.find((c) => c.method === 'session/prompt')
+  const reply = calls.find((c) => c.id === promptCall?.id && !c.method)
+  assert.deepEqual(reply?.result, { outcome: { outcome: 'cancelled' } })
+})
+
+test('maka triage fails closed when ask mode cannot be applied', async () => {
+  const f = await makeFixture('reject-ask')
+  const classified = await getAdapter('maka').classify({
+    cwd: f.home,
+    env: f.env,
+    prompt: 'classify without tools',
+    signal: new AbortController().signal,
+  })
+  assert.match(classified.error ?? '', /permission_mode=ask could not be applied/)
+  const calls = await f.readCalls()
+  assert.equal(calls.some((c) => c.method === 'session/prompt'), false)
 })
 
 test('maka probeWake exercises the acp handshake and one-shot run forwards resumeSessionId', async () => {
