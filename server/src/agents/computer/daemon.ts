@@ -466,6 +466,155 @@ interface AgentInfo {
   nativeFastMode?: boolean
 }
 
+/** One file carried on a message, as /inbox delivers it. `localPath` /
+ *  `downloadError` are NEVER wire data — the daemon sets them when it
+ *  materializes the file into the agent home (see
+ *  materializeInboxAttachment), and attachmentNote prefers them over the
+ *  URL. */
+export interface InboxAttachment {
+  name?: string
+  kind?: string
+  mime?: string
+  size?: number
+  url?: string
+  /** Home-relative path of the staged file, e.g. `attachments/<id>/data.csv`. */
+  localPath?: string
+  /** Why the daemon could not stage the file, e.g. `timed out`. */
+  downloadError?: string
+}
+
+/** Where the daemon stages inbox attachments for the agent to read. The
+ *  engine's cwd IS the agent home (see engine.ts: the home is the sandbox
+ *  root and allowRead), so a path rendered relative to the home is directly
+ *  readable by the sandboxed engine's file tools. */
+const ATTACHMENTS_DIR = 'attachments'
+/** One file may be at most the server's own per-message total (router.ts
+ *  MAX_ATTACH_TOTAL); anything larger is refused rather than staged. */
+const MAX_MATERIALIZE_BYTES = 25 * 1024 * 1024
+/** At most this many files, and this many declared bytes in total, per
+ *  snapshot — the wake must not stall on an attachment burst. Matches the
+ *  8+8 per-inbox-load precedent the cloud path uses for excerpts/vision. */
+const MAX_MATERIALIZE_FILES_PER_SNAPSHOT = 8
+const MAX_MATERIALIZE_TOTAL_BYTES = 50 * 1024 * 1024
+
+/** Strip a user-supplied filename down to a safe basename: no directory
+ *  components on either separator, no control characters, bounded length.
+ *  The name comes from the uploader, so `../../etc/passwd` must land as
+ *  `passwd` inside the staging dir, never outside it. Exported for tests. */
+export function sanitizeAttachmentFilename(name: string | undefined): string {
+  const base = (name ?? '').split(/[\\/]/).pop() ?? ''
+  const clean = base.replace(/[\u0000-\u001f\u007f]/g, '').trim()
+  if (!clean || clean === '.' || clean === '..') return 'file'
+  return clean.slice(0, 120)
+}
+
+function sanitizeMessageId(id: string | undefined): string | null {
+  return typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(id) ? id : null
+}
+
+/** Same containment rule as local-attachment-files.ts: the resolved target
+ *  must stay under the staging root. */
+function isWithin(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate)
+  return rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
+}
+
+/** Short, URL-free reason for the digest line. The failure reason must
+ *  never contain the attachment URL — it carries a signature. */
+function downloadFailureReason(error: unknown): string {
+  if (error instanceof Error && error.name === 'AbortError') return 'timed out'
+  return 'network error'
+}
+
+export type MaterializedAttachment =
+  | { ok: true; relativePath: string; bytes: number }
+  | { ok: false; reason: string }
+
+/** Fetch one inbox attachment into the agent home so the sandboxed engine
+ *  can read it with normal filesystem access instead of a CDN URL it can
+ *  never fetch: the sandbox allowlist is empty and WebFetch is denied (see
+ *  claudeSecureSettings in engine.ts), so the URL only ever bought a curl
+ *  that failed identically on every retry. The daemon fetches because it
+ *  runs OUTSIDE the sandbox and the URL is HMAC-signed and fresh at wake
+ *  time (the server re-signs on /inbox); the sandbox stays fail-closed —
+ *  no new egress for anything the model spawns.
+ *
+ *  Never throws: every failure mode returns `{ ok: false, reason }` so a
+ *  bad file can never break the wake that carries it. `fetchImpl` is
+ *  injectable so tests can stub the download without network. Exported for
+ *  tests. */
+export async function materializeInboxAttachment(
+  homeDir: string,
+  messageId: string,
+  att: InboxAttachment | null | undefined,
+  fetchImpl: typeof fetch = fetch,
+): Promise<MaterializedAttachment> {
+  if (!att || typeof att !== 'object') return { ok: false, reason: 'no attachment' }
+  const url = typeof att.url === 'string' && /^https?:\/\//.test(att.url) ? att.url : null
+  if (!url) return { ok: false, reason: 'no downloadable url' }
+  if (typeof att.size === 'number' && Number.isFinite(att.size) && att.size > MAX_MATERIALIZE_BYTES) {
+    return { ok: false, reason: 'file too large' }
+  }
+  const safeId = sanitizeMessageId(messageId)
+  if (!safeId) return { ok: false, reason: 'invalid message id' }
+  const filename = sanitizeAttachmentFilename(att.name)
+  const attachmentsRoot = resolve(homeDir, ATTACHMENTS_DIR)
+  const dir = resolve(attachmentsRoot, safeId)
+  const target = resolve(dir, filename)
+  if (!isWithin(attachmentsRoot, target)) return { ok: false, reason: 'unsafe path' }
+  // Idempotent: a previous wake already staged this exact file.
+  try {
+    const existing = await stat(target)
+    if (existing.isFile() && typeof att.size === 'number' && existing.size === att.size) {
+      return { ok: true, relativePath: `${ATTACHMENTS_DIR}/${safeId}/${filename}`, bytes: existing.size }
+    }
+  } catch { /* not staged yet — download below */ }
+  let res: Response
+  try {
+    res = await fetchImpl(url, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })
+  } catch (error) {
+    return { ok: false, reason: downloadFailureReason(error) }
+  }
+  if (!res.ok) return { ok: false, reason: `HTTP ${res.status}` }
+  const contentLength = res.headers.get('content-length')
+  if (contentLength !== null) {
+    const declared = Number(contentLength)
+    if (!Number.isFinite(declared) || declared > MAX_MATERIALIZE_BYTES) {
+      return { ok: false, reason: 'file too large' }
+    }
+  }
+  const reader = res.body?.getReader()
+  if (!reader) return { ok: false, reason: 'empty response' }
+  // Stream with a byte cap: a lying Content-Length or chunked body cannot
+  // blow the disk. The file is written only once fully downloaded, so a
+  // failure never leaves a partial file behind.
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > MAX_MATERIALIZE_BYTES) {
+        await reader.cancel().catch(() => undefined)
+        return { ok: false, reason: 'file too large' }
+      }
+      chunks.push(value)
+    }
+  } catch (error) {
+    return { ok: false, reason: downloadFailureReason(error) }
+  } finally {
+    reader.releaseLock()
+  }
+  try {
+    await mkdir(dir, { recursive: true })
+    await writeFile(target, Buffer.concat(chunks))
+  } catch {
+    return { ok: false, reason: 'could not save file' }
+  }
+  return { ok: true, relativePath: `${ATTACHMENTS_DIR}/${safeId}/${filename}`, bytes: total }
+}
+
 /** One line's worth of "there is a file on this message".
  *
  *  The attachment already travelled: /inbox selects `m.attachment` and the
@@ -474,11 +623,20 @@ interface AgentInfo {
  *  when a user asked why it could not see their zip. The cloud path (turn.ts)
  *  has always surfaced attachments; only this one dropped them.
  *
- *  Name, type and size go inline so the agent can reason about the file, and the
- *  URL follows so it can actually fetch it. Bounded, because this shares the
- *  digest's line budget with the message bodies. */
+ *  Name, type and size go inline so the agent can reason about the file.
+ *  When the daemon staged the file into the agent home, the LOCAL path
+ *  follows instead of the URL — the path is relative to the agent home,
+ *  which is the engine's working directory, so `Read` just works. The URL
+ *  is only the fallback when no staging was attempted (e.g. the snapshot
+ *  budget ran out): for the secure engine it is unreachable, but a
+ *  non-sandboxed engine can still fetch it, and hiding the file entirely
+ *  would be worse. A failed staging renders the failure instead, so the
+ *  agent learns the truth — the daemon already tried, from outside the
+ *  sandbox — rather than retrying a curl that can never succeed.
+ *  Bounded, because this shares the digest's line budget with the message
+ *  bodies. */
 export function attachmentNote(
-  att: { name?: string; kind?: string; mime?: string; size?: number; url?: string } | null | undefined,
+  att: InboxAttachment | null | undefined,
 ): string {
   if (!att || typeof att !== 'object') return ''
   const name = typeof att.name === 'string' && att.name.trim() ? att.name.trim().slice(0, 120) : 'file'
@@ -488,6 +646,12 @@ export function attachmentNote(
   const size = typeof att.size === 'number' && Number.isFinite(att.size) && att.size > 0
     ? ` ${att.size >= 1024 * 1024 ? `${(att.size / 1024 / 1024).toFixed(1)}MB` : `${Math.max(1, Math.round(att.size / 1024))}KB`}`
     : ''
+  if (typeof att.localPath === 'string' && att.localPath) {
+    return `  [attachment: ${name}${type ? ` · ${type}` : ''}${size} ${att.localPath.slice(0, 200)}]`
+  }
+  if (typeof att.downloadError === 'string' && att.downloadError) {
+    return `  [attachment: ${name}${type ? ` · ${type}` : ''}${size} download failed: ${att.downloadError.slice(0, 120)}]`
+  }
   const url = typeof att.url === 'string' && /^https?:\/\//.test(att.url) ? ` ${att.url}` : ''
   return `  [attachment: ${name}${type ? ` · ${type}` : ''}${size}${url}]`
 }
@@ -507,7 +671,7 @@ interface RuntimeInboxResponse {
     kind?: string
     /** Already delivered by /inbox (loadInbox selects m.attachment) and, until
      *  now, dropped on the floor when the digest line was built. */
-    attachment?: { name?: string; kind?: string; mime?: string; size?: number; url?: string } | null
+    attachment?: InboxAttachment | null
     sequence?: number
   }>
 }
@@ -2600,6 +2764,17 @@ export class AgentRunner {
     let hasReal = false
     // rows are ordered created_at ASC, so the last row per conversation is its
     // newest unread message — exactly the cursor we want to advance to.
+    //
+    // Collect first, render second: attachment downloads run CONCURRENTLY
+    // (Promise.all below) instead of stalling the wake on each file in turn.
+    // Each fetch is capped by HTTP_TIMEOUT_MS; sequential worst case would be
+    // MAX_MATERIALIZE_FILES_PER_SNAPSHOT × 20s before the engine even starts.
+    const pending: Array<{
+      row: NonNullable<RuntimeInboxResponse['rows']>[number]
+      convo: { head: string; msgs: string[] }
+      who: string
+      body: string
+    }> = []
     for (const row of inbox?.rows ?? []) {
       if (typeof row.conversation_id !== 'string' || !row.conversation_id) continue
       if (typeof row.id === 'string' && row.id) seen.set(row.conversation_id, row.id)
@@ -2627,10 +2802,54 @@ export class AgentRunner {
       const body = (row.kind === 'system'
         ? (alarm ? `[calendar:due] ${[alarm.title, alarm.agentPrompt].filter(Boolean).join(' — ') || 'scheduled alarm fired'}` : '[system]')
         : (row.body ?? '')).replace(/\s+/g, ' ').slice(0, 600)
+      pending.push({ row, convo, who, body })
+    }
+    // Materialize attachments into the agent home (bounded: at most
+    // MAX_MATERIALIZE_FILES_PER_SNAPSHOT files and
+    // MAX_MATERIALIZE_TOTAL_BYTES of declared bytes per snapshot). Rows past
+    // the budget keep the legacy URL rendering — today's behavior, no
+    // regression — because the daemon never attempted them.
+    const materialized = new Map<string, MaterializedAttachment>()
+    const queued = new Set<string>()
+    let plannedBytes = 0
+    const downloads: Array<Promise<void>> = []
+    for (const { row } of pending) {
+      const att = row.attachment
+      if (!att || typeof att !== 'object') continue
+      const id = typeof row.id === 'string' ? row.id : ''
+      if (!id || queued.has(id)) continue
+      if (downloads.length >= MAX_MATERIALIZE_FILES_PER_SNAPSHOT) break
+      const declared = typeof att.size === 'number' && Number.isFinite(att.size) && att.size > 0
+        ? att.size
+        : MAX_MATERIALIZE_BYTES
+      if (plannedBytes + declared > MAX_MATERIALIZE_TOTAL_BYTES) continue
+      plannedBytes += declared
+      queued.add(id)
+      downloads.push(
+        materializeInboxAttachment(this.home, id, att).then((result) => {
+          materialized.set(id, result)
+        }),
+      )
+    }
+    await Promise.all(downloads)
+    for (const { row, convo, who, body } of pending) {
+      const att = row.attachment
+      // Enrich a COPY with the staging outcome — never mutate the row the
+      // server sent. No entry means the daemon never attempted this file, so
+      // attachmentNote falls back to the URL rendering.
+      const enriched = att && typeof att === 'object' && typeof row.id === 'string'
+        ? (() => {
+          const result = materialized.get(row.id)
+          if (!result) return att
+          return result.ok
+            ? { ...att, localPath: result.relativePath }
+            : { ...att, downloadError: result.reason }
+        })()
+        : att
       // Keep the message id + convo id on each line (like the cloud agent's
       // context) so the engine can QUOTE the exact message: `cumora reply
       // <convo> '<body>' --quote <message_id>`.
-      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${attachmentNote(row.attachment)}`)
+      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${attachmentNote(enriched)}`)
     }
     const projectIds = uniqueProjectIds(
       (inbox?.rows ?? []).map((r) => (typeof r.project_id === 'string' ? r.project_id : null)),
